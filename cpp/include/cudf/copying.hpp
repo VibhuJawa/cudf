@@ -487,6 +487,58 @@ std::vector<contiguous_split_result> contiguous_split(
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
+ * @brief Table data in a serialized format
+ *
+ * Contains data from a table in two contiguous buffers: one on host, which contains table metadata
+ * and one on device which contains the table data.
+ */
+struct packed_columns {
+  packed_columns() = default;
+  packed_columns(std::unique_ptr<std::vector<uint8_t>> metadata,
+                 std::unique_ptr<rmm::device_buffer> data)
+    : metadata(std::move(metadata)), data(std::move(data)){};
+  std::unique_ptr<std::vector<uint8_t>> metadata;
+  std::unique_ptr<rmm::device_buffer> data;
+};
+
+/**
+ * @brief Deep-copy a `table_view` into a serialized contiguous memory format
+ *
+ * The metadata from the `table_view` is copied into a host vector of bytes and the data from the
+ * `table_view` is copied into a `device_buffer`. Pass the output of this function into
+ * `cudf::experimental::unpack` to deserialize.
+ *
+ * @param input View of the table to pack
+ * @param[in] mr Optional, The resource to use for all returned device allocations
+ * @return packed_columns A struct containing the serialized metadata and data in contiguous host
+ *         and device memory respectively
+ */
+packed_columns pack(std::vector<column_view> const& input,
+                    rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
+
+struct unpack_result {
+  std::vector<column_view> columns;
+  std::unique_ptr<rmm::device_buffer> all_data;
+};
+
+/**
+ * @brief Deserialize the result of `cudf::experimental::pack`
+ *
+ * Converts the result of a serialized table into a `table_view` that points to the data stored in
+ * the contiguous device buffer `output.all_data`. The data for the table `output.all_data` is moved
+ * from the input `packed_table`'s member `table_data`.
+ *
+ * It is the caller's responsibility to ensure that the `table_view` in the output does not outlive
+ * the device_buffer `all_data` in the output.
+ *
+ * No new device memory is allocated in this function.
+ *
+ * @param input The packed table to unpack
+ * @return contiguous_split_result The unpacked `table_view` and corresponding device data buffer
+ */
+unpack_result unpack(std::unique_ptr<packed_columns> input);
+
+/**
  * @brief   Returns a new column, where each element is selected from either @p lhs or
  *          @p rhs based on the value of the corresponding element in @p boolean_mask
  *
@@ -564,7 +616,7 @@ std::unique_ptr<column> shift(column_view const& input,
  * @param[in] rhs right-hand column_view
  * @param[in] boolean_mask column of `BOOL8` representing "left (true) / right (false)" boolean for
  * each element. Null element represents false.
- * @param[in] mr Device memory resource used to allocate the returned column's device memory
+ * @param[in] mr resource for allocating device memory
  *
  * @returns new column with the selected elements
  */
@@ -588,7 +640,7 @@ std::unique_ptr<column> copy_if_else(
  * @param[in] rhs right-hand scalar
  * @param[in] boolean_mask column of `BOOL8` representing "left (true) / right (false)" boolean for
  * each element. Null element represents false.
- * @param[in] mr Device memory resource used to allocate the returned column's device memory
+ * @param[in] mr resource for allocating device memory
  *
  * @returns new column with the selected elements
  */
@@ -610,7 +662,7 @@ std::unique_ptr<column> copy_if_else(
  * @param[in] rhs right-hand scalar
  * @param[in] boolean_mask column of `BOOL8` representing "left (true) / right (false)" boolean for
  * each element. null element represents false.
- * @param[in] mr Device memory resource used to allocate the returned column's device memory
+ * @param[in] mr resource for allocating device memory
  *
  * @returns new column with the selected elements
  */
@@ -652,7 +704,7 @@ std::unique_ptr<column> copy_if_else(
  * @param[in] input table_view (set of dense columns) to scatter
  * @param[in] target table_view to modify with scattered values from `input`
  * @param[in] boolean_mask column_view which acts as boolean mask.
- * @param[in] mr Device memory resource used to allocate device memory of the returned table.
+ * @param[in] mr Optional, The resource to use for all returned allocations
  *
  * @returns Returns a table by scattering `input` into `target` as per `boolean_mask`.
  */
@@ -689,7 +741,7 @@ std::unique_ptr<table> boolean_mask_scatter(
  * @param[in] input scalars to scatter
  * @param[in] target table_view to modify with scattered values from `input`
  * @param[in] boolean_mask column_view which acts as boolean mask.
- * @param[in] mr Device memory resource used to allocate device memory of the returned table.
+ * @param[in] mr Optional, The resource to use for all returned allocations
  *
  * @returns Returns a table by scattering `input` into `target` as per `boolean_mask`.
  */
@@ -709,7 +761,7 @@ std::unique_ptr<table> boolean_mask_scatter(
  *
  * @param input Column view to get the element from
  * @param index Index into `input` to get the element at
- * @param mr Device memory resource used to allocate the returned scalar's device memory.
+ * @param mr Optional, The resource to use for all returned allocations
  * @return std::unique_ptr<scalar> Scalar containing the single value
  */
 std::unique_ptr<scalar> get_element(

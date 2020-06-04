@@ -73,6 +73,10 @@ std::vector<column_view> slice(column_view const& input,
                                std::vector<size_type> const& indices,
                                cudaStream_t stream = 0);
 
+unpack_result alloc_and_copy(std::vector<column_view> const& t,
+                             rmm::mr::device_memory_resource* mr,
+                             cudaStream_t stream);
+
 /**
  * @copydoc cudf::contiguous_split
  *
@@ -83,6 +87,15 @@ std::vector<contiguous_split_result> contiguous_split(
   std::vector<size_type> const& splits,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource(),
   cudaStream_t stream                 = 0);
+
+/**
+ * @copydoc cudf::experimental::pack
+ *
+ * @param stream Optional CUDA stream on which to execute kernels
+ **/
+packed_columns pack(cudf::table_view const& input,
+                    cudaStream_t stream                 = 0,
+                    rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
  * @copydoc cudf::allocate_like(column_view const&, size_type, mask_allocation_policy,

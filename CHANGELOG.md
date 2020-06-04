@@ -60,6 +60,7 @@
 - PR #4789 Disallow timestamp sum and diffs via binary ops
 - PR #4815 Add JNI total memory allocated API
 - PR #4906 Add Java bindings for interleave_columns
+- PR #4941 Add `cudf::pack` and `cudf::unpack`
 - PR #4900 Add `get_element` to obtain scalar from a column given an index
 - PR #4938 Add Java bindings for strip
 - PR #4923 Add Java and JNI bindings for string split
@@ -202,6 +203,7 @@
 - PR #4998 Clean up dispatch of aggregation methods in result_cache
 - PR #5000 Performance improvements in `isin` and dask_cudf backend
 - PR #5002 Fix Column.__reduce__ to accept `null_count`
+- PR #5025 Serialize/deserialize with libcudf pack/unpack
 - PR #5006 Add Java bindings for strip, lstrip and rstrip
 - PR #5047 Add Cython binding for libcudf++ CSV reader
 - PR #5027 Move nvstrings standalone docs pages to libcudf doxygen pages

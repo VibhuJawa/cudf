@@ -462,6 +462,7 @@ add_library(cudf
             src/copying/slice.cpp
             src/copying/split.cpp
             src/copying/contiguous_split.cu
+            src/copying/pack.cpp
             src/copying/copy_range.cu
             src/copying/get_element.cu
             src/filling/fill.cu

@@ -1,11 +1,14 @@
 # Copyright (c) 2020, NVIDIA CORPORATION.
 
+import numpy as np
 import pandas as pd
 
 from libcpp cimport bool
 from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.vector cimport vector
-from libc.stdint cimport int32_t
+from libc.stdint cimport int32_t, uint8_t
+
+from rmm._lib.device_buffer cimport DeviceBuffer, device_buffer
 
 from cudf._lib.column cimport Column
 from cudf._lib.scalar import as_scalar
@@ -14,6 +17,7 @@ from cudf._lib.table cimport Table
 from cudf._lib.move cimport move
 from cudf._lib.scalar cimport Scalar
 from cudf._lib.table cimport Table
+from cudf._lib.utils cimport BufferArrayFromVector
 
 from cudf._lib.cpp.column.column cimport column
 from cudf._lib.cpp.column.column_view cimport (
@@ -445,6 +449,60 @@ def table_split(Table input_table, object splits, bool keep_index=True):
         ) for i in range(num_of_result_cols)]
 
     return result
+
+
+def pack(columns):
+    """
+    Pack the given list of columns into a single contiguous bufferr
+    and associated metadata.
+    """
+    cdef vector[column_view] c_columns
+    cdef Column col
+    for col in columns:
+        c_columns.push_back(col.view())
+
+    cdef cpp_copying.packed_columns c_result
+
+    with nogil:
+        c_result = move(
+            cpp_copying.pack(
+                c_columns
+            )
+        )
+
+    # Convert to python objects:
+    data = DeviceBuffer.c_from_unique_ptr(move(c_result.data))
+    metadata = BufferArrayFromVector.from_unique_ptr(
+        move(c_result.metadata)
+    )
+    metadata = np.asarray(metadata)
+
+    return (metadata, data)
+
+
+def unpack(vector[uint8_t] metadata,
+           DeviceBuffer data):
+    """
+    Given the results of a `pack`, unpack into a list of Columns
+    """
+    cdef unique_ptr[cpp_copying.packed_columns] c_packed_columns = move(
+        make_unique[cpp_copying.packed_columns](
+            make_unique[vector[uint8_t]](metadata),
+            move(data.c_obj)
+        )
+    )
+    cdef cpp_copying.unpack_result c_result
+
+    with nogil:
+        c_result = move(
+            cpp_copying.unpack(move(c_packed_columns))
+        )
+
+    owner = DeviceBuffer.c_from_unique_ptr(move(c_result.all_data))
+    columns = []
+    for i in range(c_result.columns.size()):
+        columns.append(Column.from_column_view(c_result.columns[i], owner))
+    return columns
 
 
 def _copy_if_else_column_column(Column lhs, Column rhs, Column boolean_mask):
