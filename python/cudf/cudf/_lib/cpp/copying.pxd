@@ -3,7 +3,7 @@
 from rmm._lib.device_buffer cimport device_buffer
 
 from libcpp cimport bool
-from libc.stdint cimport int32_t
+from libc.stdint cimport int32_t, uint8_t
 from libcpp.memory cimport unique_ptr
 from libcpp.vector cimport vector
 
@@ -107,11 +107,27 @@ cdef extern from "cudf/copying.hpp" namespace "cudf" nogil:
 
     cdef struct contiguous_split_result:
         table_view table
-        vector[device_buffer] all_data
+        unique_ptr[device_buffer] all_data
 
     cdef vector[contiguous_split_result] contiguous_split (
         table_view input_table,
         vector[size_type] splits
+    ) except +
+
+    cdef struct packed_columns:
+        unique_ptr[vector[uint8_t]] metadata
+        unique_ptr[device_buffer] data
+
+    cdef struct unpack_result:
+        vector[column_view] columns
+        unique_ptr[device_buffer] all_data
+
+    cdef packed_columns pack (
+        vector[column_view] columns
+    ) except +
+
+    cdef unpack_result unpack (
+        unique_ptr[packed_columns]
     ) except +
 
     cdef unique_ptr[column] copy_if_else (

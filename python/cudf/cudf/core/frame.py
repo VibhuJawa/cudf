@@ -1,4 +1,5 @@
 import functools
+import pickle
 import warnings
 from collections import OrderedDict
 
@@ -1561,6 +1562,101 @@ class Frame(libcudf.table.Table):
         return libcudf.sort.is_sorted(
             self, ascending=ascending, null_position=null_position
         )
+
+    def serialize(self):
+        data = []
+        column_names = self._data.names
+        categorical_column_names = []
+
+        # index columns
+        if self._index is not None:
+            data.extend(self._index._data.columns)
+
+        # data columns
+        data.extend(self._data.columns)
+
+        # categories columns
+        for name, col in self._data.items():
+            if isinstance(col, cudf.core.column.CategoricalColumn):
+                data.append(col.categories)
+                categorical_column_names.append(name)
+
+        packed_meta, packed_data = libcudf.copying.pack(data)
+
+        # construct header and frames:
+        header = {}
+        header["type-serialized"] = pickle.dumps(type(self))
+        if self._index is not None:
+            header["index_names"] = pickle.dumps(self._index.names)
+        header["column_names"] = pickle.dumps(column_names)
+        header["categorical_column_names"] = pickle.dumps(
+            categorical_column_names
+        )
+        header["has_multicolumn"] = pickle.dumps(self._data.multiindex)
+        header["multicolumn_level_names"] = pickle.dumps(
+            self._data.level_names
+        )
+
+        frames = [packed_meta.data, cudf.core.buffer.Buffer(packed_data)]
+
+        return header, frames
+
+    @classmethod
+    def deserialize(self, header, frames):
+        typ = pickle.loads(header["type-serialized"])
+        column_names = pickle.loads(header["column_names"])
+        categorical_column_names = pickle.loads(
+            header["categorical_column_names"]
+        )
+        has_multicolumn = pickle.loads(header["has_multicolumn"])
+        multicolumn_level_names = pickle.loads(
+            header["multicolumn_level_names"]
+        )
+
+        if "index_names" in header:
+            index_names = pickle.loads(header["index_names"])
+            num_index_columns = len(index_names)
+        else:
+            index_names = []
+            num_index_columns = 0
+
+        num_data_columns = len(column_names)
+        num_categorical_columns = len(categorical_column_names)
+
+        if not isinstance(frames[1], cudf.core.buffer.Buffer):
+            frames[1] = cudf.core.buffer.Buffer(frames[1])
+
+        # unpack into columns
+        columns = libcudf.copying.unpack(frames[0], frames[1]._owner)
+
+        # construct Index
+        if num_index_columns:
+            index_columns = columns[: len(index_names)]
+            index = cudf.core.index.Index._from_table(
+                libcudf.table.Table(dict(zip(index_names, index_columns)))
+            )
+        else:
+            index = None
+
+        # construct data dictionary
+        data_columns = columns[
+            num_index_columns : num_index_columns + num_data_columns
+        ]
+        data = dict(zip(column_names, data_columns))
+
+        # add category information back to categorical columns:
+        categorical_columns = columns[-num_categorical_columns:]
+        for i, name in enumerate(categorical_column_names):
+            mask = data[name].mask
+            data[name].set_base_mask(None)
+            data[name] = cudf.core.column.build_categorical_column(
+                categories=categorical_columns[i], codes=data[name], mask=mask
+            )
+
+        tbl = libcudf.table.Table(data, index=index)
+        tbl._data.multiindex = has_multicolumn
+        tbl._data.level_names = multicolumn_level_names
+        return typ._from_table(tbl)
 
 
 def _get_replacement_values(to_replace, replacement, col_name, column):

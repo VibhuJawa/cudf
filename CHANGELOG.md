@@ -1,4 +1,21 @@
 # cuDF 0.14.0 (03 Jun 2020)
+# cuDF 0.15.0 (Date TBD)
+
+## New Features
+
+## Improvements
+
+- PR #5268 Rely on NumPy arrays for out-of-band pickling
+- PR #5288 Drop `auto_pickle` decorator #5288
+- PR #5231 Type `Buffer` as `uint8`
+- PR #5308 Coerce frames to `Buffer`s in deserialization
+- PR #5309 Handle host frames in serialization
+
+## Bug Fixes
+
+- PR #5269 Explicitly require NumPy
+
+# cuDF 0.14.0 (Date TBD)
 
 ## New Features
 
@@ -12,6 +29,7 @@
 - PR #4789 Disallow timestamp sum and diffs via binary ops
 - PR #4815 Add JNI total memory allocated API
 - PR #4906 Add Java bindings for interleave_columns
+- PR #4941 Add `cudf::pack` and `cudf::unpack`
 - PR #4900 Add `get_element` to obtain scalar from a column given an index
 - PR #4938 Add Java bindings for strip
 - PR #4923 Add Java and JNI bindings for string split
@@ -154,6 +172,7 @@
 - PR #4998 Clean up dispatch of aggregation methods in result_cache
 - PR #5000 Performance improvements in `isin` and dask_cudf backend
 - PR #5002 Fix Column.__reduce__ to accept `null_count`
+- PR #5025 Serialize/deserialize with libcudf pack/unpack
 - PR #5006 Add Java bindings for strip, lstrip and rstrip
 - PR #5047 Add Cython binding for libcudf++ CSV reader
 - PR #5027 Move nvstrings standalone docs pages to libcudf doxygen pages
@@ -205,6 +224,7 @@
 - PR #5270 Add support to check for "NaT" and "None" strings while typecasting to `datetime64`
 - PR #5298 Remove unused native deps from java library
 - PR #5216 Make documentation uniform for params
+- PR #5261 Add short git commit to conda package name
 
 ## Bug Fixes
 
