@@ -97,6 +97,7 @@ constexpr std::uint8_t default_rows_per_miniblock_log = 12;
 constexpr std::size_t sparse_header_batch_min_reads = 8;
 constexpr std::size_t sparse_multi_column_header_batch_min_reads = 2;
 constexpr std::size_t sparse_copy_batch_min_chunks = 2;
+constexpr std::size_t sparse_max_coalesced_miniblock_reads = 4;
 constexpr std::size_t miniblock_alignment = 8;
 constexpr std::array<std::uint8_t, 4> lance_magic{'L', 'A', 'N', 'C'};
 
@@ -2806,10 +2807,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
               auto range_offset          = selected_chunks[idx].chunk.buffer_offset;
               auto range_size            = selected_chunks[idx].chunk.buffer_size;
               input_offsets[idx]         = input_offset;
-              auto range_chunks          = 1;
+              std::size_t range_chunks   = 1;
               ++idx;
               while (idx < selected_chunks.size() &&
-                     range_chunks < 2 &&
+                     range_chunks < sparse_max_coalesced_miniblock_reads &&
                      selected_chunks[idx].chunk.buffer_offset == range_offset + range_size) {
                 input_offsets[idx] = input_offset + static_cast<std::size_t>(range_size);
                 range_size += selected_chunks[idx].chunk.buffer_size;
