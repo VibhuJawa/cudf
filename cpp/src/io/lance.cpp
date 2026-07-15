@@ -106,6 +106,7 @@ namespace {
 constexpr std::size_t lance_buffer_alignment = 64;
 constexpr std::uint8_t lance_pad_byte        = 72;
 constexpr std::uint32_t default_rows_per_page = 64 * 1024;
+constexpr std::uint8_t default_rows_per_page_log = 16;
 constexpr std::uint32_t default_rows_per_miniblock = 4096;
 constexpr std::uint8_t default_rows_per_miniblock_log = 12;
 constexpr std::size_t sparse_header_batch_min_reads = 8;
@@ -2290,9 +2291,22 @@ std::vector<size_type> selected_columns(lance_file_info const& file_info,
 std::size_t find_page_for_row(std::vector<lance_page_info> const& pages, size_type row)
 {
   auto const row_u64 = static_cast<std::uint64_t>(row);
-  for (std::size_t idx = 0; idx < pages.size(); ++idx) {
+  auto const default_idx = static_cast<std::size_t>(row_u64 >> default_rows_per_page_log);
+  if (default_idx < pages.size()) {
+    auto const& page = pages[default_idx];
+    if (row_u64 >= page.priority && row_u64 < page.priority + page.length) {
+      return default_idx;
+    }
+  }
+
+  auto const found = std::upper_bound(
+    pages.begin(), pages.end(), row_u64, [](auto value, auto const& page) {
+      return value < page.priority;
+    });
+  if (found != pages.begin()) {
+    auto const idx  = static_cast<std::size_t>(std::distance(pages.begin(), found - 1));
     auto const& page = pages[idx];
-    if (row_u64 >= page.priority && row_u64 < page.priority + page.length) { return idx; }
+    if (row_u64 < page.priority + page.length) { return idx; }
   }
   CUDF_FAIL("Lance row selection references a row without a data page");
 }
@@ -2401,9 +2415,24 @@ std::size_t find_miniblock_chunk_for_row(std::vector<miniblock_chunk_info> const
                                          size_type row)
 {
   auto const row_u64 = static_cast<std::uint64_t>(row);
-  for (std::size_t idx = 0; idx < chunks.size(); ++idx) {
+
+  auto const default_idx =
+    static_cast<std::size_t>(row_u64 >> default_rows_per_miniblock_log);
+  if (default_idx < chunks.size()) {
+    auto const& chunk = chunks[default_idx];
+    if (row_u64 >= chunk.row_begin && row_u64 < chunk.row_begin + chunk.num_rows) {
+      return default_idx;
+    }
+  }
+
+  auto const found = std::upper_bound(
+    chunks.begin(), chunks.end(), row_u64, [](auto value, auto const& chunk) {
+      return value < chunk.row_begin;
+    });
+  if (found != chunks.begin()) {
+    auto const idx   = static_cast<std::size_t>(std::distance(chunks.begin(), found - 1));
     auto const& chunk = chunks[idx];
-    if (row_u64 >= chunk.row_begin && row_u64 < chunk.row_begin + chunk.num_rows) { return idx; }
+    if (row_u64 < chunk.row_begin + chunk.num_rows) { return idx; }
   }
   CUDF_FAIL("Lance row selection references a row without a MiniBlock chunk");
 }
