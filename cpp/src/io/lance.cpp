@@ -1205,6 +1205,12 @@ struct pending_lance_page {
   std::size_t chunk_count{};
 };
 
+struct pending_lance_column {
+  std::size_t type_width{};
+  std::vector<pending_lance_page> pages;
+  std::vector<pending_miniblock_chunk> chunks;
+};
+
 void append_page_chunks(std::vector<pending_miniblock_chunk>& chunks,
                         column_view const& column,
                         size_type row_begin,
@@ -1251,7 +1257,7 @@ void finalize_miniblock_chunks(std::vector<pending_miniblock_chunk>& chunks)
 }
 
 rmm::device_uvector<std::uint8_t> compress_zstd_miniblocks(
-  std::vector<pending_miniblock_chunk>& chunks, rmm::cuda_stream_view stream)
+  std::vector<pending_miniblock_chunk*>& chunks, rmm::cuda_stream_view stream)
 {
   if (chunks.empty()) { return rmm::device_uvector<std::uint8_t>(0, stream); }
 
@@ -1272,7 +1278,7 @@ rmm::device_uvector<std::uint8_t> compress_zstd_miniblocks(
   std::size_t compressed_buffer_size = 0;
 
   for (std::size_t idx = 0; idx < chunks.size(); ++idx) {
-    auto const& chunk = chunks[idx];
+    auto const& chunk = *chunks[idx];
     CUDF_EXPECTS(!max_allowed.has_value() || chunk.payload_size <= *max_allowed,
                  "Lance ZSTD chunk is larger than nvCOMP's maximum supported chunk size");
     needs_aligned_inputs |= required_alignment > 1 &&
@@ -1296,8 +1302,8 @@ rmm::device_uvector<std::uint8_t> compress_zstd_miniblocks(
     for (std::size_t idx = 0; idx < chunks.size(); ++idx) {
       CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::uint8_t*>(aligned_inputs.data()) +
                                       input_offsets[idx],
-                                    chunks[idx].payload,
-                                    chunks[idx].payload_size,
+                                    chunks[idx]->payload,
+                                    chunks[idx]->payload_size,
                                     cudaMemcpyDeviceToDevice,
                                     stream.value()));
     }
@@ -1310,8 +1316,8 @@ rmm::device_uvector<std::uint8_t> compress_zstd_miniblocks(
     auto const* input = needs_aligned_inputs
                           ? static_cast<std::uint8_t const*>(aligned_inputs.data()) +
                               input_offsets[idx]
-                          : chunks[idx].payload;
-    inputs[idx] = device_span<std::uint8_t const>{input, chunks[idx].payload_size};
+                          : chunks[idx]->payload;
+    inputs[idx] = device_span<std::uint8_t const>{input, chunks[idx]->payload_size};
   }
   inputs.host_to_device_async(stream);
 
@@ -1338,8 +1344,8 @@ rmm::device_uvector<std::uint8_t> compress_zstd_miniblocks(
   for (std::size_t idx = 0; idx < chunks.size(); ++idx) {
     CUDF_EXPECTS(results[idx].status == cudf::io::detail::codec_status::SUCCESS,
                  "nvCOMP ZSTD failed to compress a Lance page");
-    chunks[idx].payload      = compressed.data() + output_offsets[idx];
-    chunks[idx].payload_size = results[idx].bytes_written;
+    chunks[idx]->payload      = compressed.data() + output_offsets[idx];
+    chunks[idx]->payload_size = results[idx].bytes_written;
   }
   return compressed;
 }
@@ -1540,15 +1546,14 @@ std::vector<page_metadata> write_column_pages(
   std::vector<pending_lance_page> const& pending_pages,
   std::size_t type_width,
   compression_type compression,
-  rmm::cuda_stream_view stream)
+  std::vector<lance_pack_chunk>& pack_chunks,
+  std::uint64_t& data_size)
 {
   std::vector<page_metadata> pages;
   pages.reserve(pending_pages.size());
-  std::vector<std::uint64_t> miniblock_buffer_sizes;
-  miniblock_buffer_sizes.reserve(pending_pages.size());
-  std::vector<std::size_t> page_data_offsets;
-  page_data_offsets.reserve(pending_pages.size());
-  std::uint64_t column_data_size = 0;
+  static constexpr auto miniblock_header_size = sizeof(std::uint16_t) + sizeof(std::uint32_t);
+  static constexpr auto miniblock_header_pad  = miniblock_alignment - miniblock_header_size;
+  static_assert(miniblock_header_size + miniblock_header_pad == miniblock_alignment);
 
   for (auto const& pending_page : pending_pages) {
     CUDF_EXPECTS(pending_page.chunk_begin <= chunks.size() &&
@@ -1575,35 +1580,11 @@ std::vector<page_metadata> write_column_pages(
     page.buffer_sizes.push_back(metadata_buffer.size());
     write_aligned_host_buffer(sink, metadata_buffer.data(), metadata_buffer.size());
 
-    CUDF_EXPECTS(column_data_size <= std::numeric_limits<std::size_t>::max(),
-                 "Lance column data buffer is too large");
-    page_data_offsets.push_back(static_cast<std::size_t>(column_data_size));
-    miniblock_buffer_sizes.push_back(miniblock_buffer_size);
-    column_data_size += miniblock_buffer_size + pad_size(miniblock_buffer_size);
-    pages.push_back(std::move(page));
-  }
-
-  CUDF_EXPECTS(column_data_size <= std::numeric_limits<std::size_t>::max(),
-               "Lance column data buffer is too large");
-  auto column_data =
-    rmm::device_uvector<std::uint8_t>(static_cast<std::size_t>(column_data_size), stream);
-  if (column_data.size() > 0) {
-    CUDF_CUDA_TRY(cudaMemsetAsync(
-      column_data.data(), lance_pad_byte, column_data.size(), stream.value()));
-  }
-
-  auto const data_begin = sink->bytes_written();
-  static constexpr auto miniblock_header_size = sizeof(std::uint16_t) + sizeof(std::uint32_t);
-  static constexpr auto miniblock_header_pad  = miniblock_alignment - miniblock_header_size;
-  static_assert(miniblock_header_size + miniblock_header_pad == miniblock_alignment);
-  std::vector<lance_pack_chunk> pack_chunks;
-  pack_chunks.reserve(chunks.size());
-  for (std::size_t page_idx = 0; page_idx < pending_pages.size(); ++page_idx) {
-    auto const& pending_page      = pending_pages[page_idx];
-    auto const miniblock_buf_size = miniblock_buffer_sizes[page_idx];
-    auto const page_data_begin    = page_data_offsets[page_idx];
-    pages[page_idx].buffer_offsets.push_back(data_begin + page_data_begin);
-    pages[page_idx].buffer_sizes.push_back(miniblock_buf_size);
+    CUDF_EXPECTS(data_size <= std::numeric_limits<std::size_t>::max(),
+                 "Lance data buffer is too large");
+    auto const page_data_begin = static_cast<std::size_t>(data_size);
+    page.buffer_offsets.push_back(page_data_begin);
+    page.buffer_sizes.push_back(miniblock_buffer_size);
 
     std::size_t page_data_offset = page_data_begin;
     for (std::size_t idx = 0; idx < pending_page.chunk_count; ++idx) {
@@ -1612,22 +1593,11 @@ std::vector<page_metadata> write_column_pages(
       page_data_offset += miniblock_header_size + miniblock_header_pad;
       page_data_offset += chunk.payload_size + pad_size(chunk.payload_size, miniblock_alignment);
     }
-    CUDF_EXPECTS(page_data_offset == page_data_begin + miniblock_buf_size,
+    CUDF_EXPECTS(page_data_offset == page_data_begin + miniblock_buffer_size,
                  "Packed Lance MiniBlock size mismatch");
+    data_size += miniblock_buffer_size + pad_size(miniblock_buffer_size);
+    pages.push_back(std::move(page));
   }
-
-  if (!pack_chunks.empty()) {
-    rmm::device_uvector<lance_pack_chunk> device_pack_chunks(pack_chunks.size(), stream);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(device_pack_chunks.data(),
-                                  pack_chunks.data(),
-                                  pack_chunks.size() * sizeof(lance_pack_chunk),
-                                  cudaMemcpyHostToDevice,
-                                  stream.value()));
-    pack_lance_miniblocks(
-      device_pack_chunks.data(), device_pack_chunks.size(), column_data.data(), stream);
-  }
-
-  write_device_buffer(sink, column_data.data(), column_data.size(), stream);
 
   return pages;
 }
@@ -1690,29 +1660,79 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
   CUDF_EXPECTS(page_rows_in > 0, "max_rows_per_page must be greater than zero");
 
   std::vector<column_metadata> columns(table.num_columns());
+  std::vector<pending_lance_column> pending_columns(table.num_columns());
   for (size_type col_idx = 0; col_idx < table.num_columns(); ++col_idx) {
     auto const column = table.column(col_idx);
-    auto const type_width = cudf::size_of(column.type());
-    std::vector<pending_lance_page> pending_pages;
-    std::vector<pending_miniblock_chunk> chunks;
+    auto& pending_column = pending_columns[static_cast<std::size_t>(col_idx)];
+    pending_column.type_width = cudf::size_of(column.type());
 
     for (size_type row = 0; row < table.num_rows(); row += page_rows_in) {
       auto const rows = std::min(page_rows_in, table.num_rows() - row);
-      auto const chunk_begin = chunks.size();
-      append_page_chunks(chunks, column, row, rows);
-      pending_pages.push_back(
-        pending_lance_page{row, rows, chunk_begin, chunks.size() - chunk_begin});
+      auto const chunk_begin = pending_column.chunks.size();
+      append_page_chunks(pending_column.chunks, column, row, rows);
+      pending_column.pages.push_back(pending_lance_page{
+        row, rows, chunk_begin, pending_column.chunks.size() - chunk_begin});
     }
-
-    std::optional<rmm::device_uvector<std::uint8_t>> compressed_payloads;
-    if (compression == compression_type::ZSTD) {
-      compressed_payloads.emplace(compress_zstd_miniblocks(chunks, stream));
-    }
-    finalize_miniblock_chunks(chunks);
-
-    columns[col_idx].pages =
-      write_column_pages(sink, chunks, pending_pages, type_width, compression, stream);
   }
+
+  std::optional<rmm::device_uvector<std::uint8_t>> compressed_payloads;
+  if (compression == compression_type::ZSTD) {
+    std::vector<pending_miniblock_chunk*> chunks_to_compress;
+    for (auto& pending_column : pending_columns) {
+      chunks_to_compress.reserve(chunks_to_compress.size() + pending_column.chunks.size());
+      for (auto& chunk : pending_column.chunks) {
+        chunks_to_compress.push_back(&chunk);
+      }
+    }
+    compressed_payloads.emplace(compress_zstd_miniblocks(chunks_to_compress, stream));
+  }
+
+  std::size_t total_chunks = 0;
+  for (auto const& pending_column : pending_columns) {
+    total_chunks += pending_column.chunks.size();
+  }
+  std::vector<lance_pack_chunk> pack_chunks;
+  pack_chunks.reserve(total_chunks);
+  std::uint64_t data_size = 0;
+  for (size_type col_idx = 0; col_idx < table.num_columns(); ++col_idx) {
+    auto& pending_column = pending_columns[static_cast<std::size_t>(col_idx)];
+    finalize_miniblock_chunks(pending_column.chunks);
+    columns[col_idx].pages =
+      write_column_pages(sink,
+                         pending_column.chunks,
+                         pending_column.pages,
+                         pending_column.type_width,
+                         compression,
+                         pack_chunks,
+                         data_size);
+  }
+
+  auto const data_begin = sink->bytes_written();
+  for (auto& column : columns) {
+    for (auto& page : column.pages) {
+      CUDF_EXPECTS(page.buffer_offsets.size() == 2,
+                   "Invalid Lance page buffer offsets while writing");
+      page.buffer_offsets[1] += data_begin;
+    }
+  }
+
+  CUDF_EXPECTS(data_size <= std::numeric_limits<std::size_t>::max(),
+               "Lance data buffer is too large");
+  rmm::device_uvector<std::uint8_t> data(static_cast<std::size_t>(data_size), stream);
+  if (data.size() > 0) {
+    CUDF_CUDA_TRY(cudaMemsetAsync(data.data(), lance_pad_byte, data.size(), stream.value()));
+  }
+  if (!pack_chunks.empty()) {
+    rmm::device_uvector<lance_pack_chunk> device_pack_chunks(pack_chunks.size(), stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_pack_chunks.data(),
+                                  pack_chunks.data(),
+                                  pack_chunks.size() * sizeof(lance_pack_chunk),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    pack_lance_miniblocks(device_pack_chunks.data(), device_pack_chunks.size(), data.data(), stream);
+  }
+  write_device_buffer(sink, data.data(), data.size(), stream);
+
   return columns;
 }
 
