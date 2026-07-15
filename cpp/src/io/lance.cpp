@@ -1997,6 +1997,26 @@ std::vector<size_type> selected_columns(lance_file_info const& file_info,
     return columns;
   }
 
+  constexpr std::size_t linear_column_lookup_max_fields = 32;
+  if (file_info.fields.size() <= linear_column_lookup_max_fields) {
+    columns.reserve(requested.size());
+    for (auto const& name : requested) {
+      auto found = std::find_if(file_info.fields.begin(),
+                                file_info.fields.end(),
+                                [&](auto const& field) { return field.name == name; });
+      CUDF_EXPECTS(found != file_info.fields.end(), "Requested Lance column not found: " + name);
+      auto const column_idx =
+        static_cast<std::size_t>(std::distance(file_info.fields.begin(), found));
+      CUDF_EXPECTS(column_idx <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
+                   "Lance file contains too many columns for cuDF");
+      CUDF_EXPECTS(found->is_supported(),
+                   "Requested Lance column is not supported: " + found->name + " (" +
+                     found->unsupported_reason + ")");
+      columns.push_back(static_cast<size_type>(column_idx));
+    }
+    return columns;
+  }
+
   std::unordered_map<std::string, size_type> field_indices;
   for (std::size_t idx = 0; idx < file_info.fields.size(); ++idx) {
     CUDF_EXPECTS(idx <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
