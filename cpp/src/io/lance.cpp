@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -37,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1432,6 +1434,7 @@ struct selected_miniblock_payload {
 struct dense_miniblock_read {
   miniblock_chunk_info chunk;
   std::uint8_t const* page_data{};
+  std::uint8_t* output{};
   std::uint64_t page_data_size{};
   std::size_t header_offset{};
   std::size_t raw_size{};
@@ -1439,14 +1442,23 @@ struct dense_miniblock_read {
   compression_type compression{};
 };
 
-void read_dense_pages_values_into(datasource* source,
-                                  std::vector<lance_page_info> const& pages,
-                                  data_type type,
-                                  std::uint8_t* output,
-                                  rmm::cuda_stream_view stream,
-                                  rmm::device_async_resource_ref mr)
+struct dense_page_read {
+  lance_page_info const* page{};
+  data_type type{type_id::EMPTY};
+  std::uint8_t* output{};
+};
+
+void read_dense_page_values_into(datasource* source,
+                                 std::vector<dense_page_read> const& page_reads,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
 {
-  auto const type_width = cudf::size_of(type);
+  std::vector<lance_page_info> pages;
+  pages.reserve(page_reads.size());
+  std::transform(page_reads.begin(),
+                 page_reads.end(),
+                 std::back_inserter(pages),
+                 [](auto const& read) { return *read.page; });
   auto page_buffers = read_page_data_buffers(source, pages, stream, mr);
 
   std::vector<device_span<std::uint8_t const>> inputs;
@@ -1457,7 +1469,9 @@ void read_dense_pages_values_into(datasource* source,
   std::size_t total_raw_size = 0;
   std::size_t max_raw_size   = 0;
 
-  for (std::size_t page_idx = 0; page_idx < pages.size(); ++page_idx) {
+  for (std::size_t page_idx = 0; page_idx < page_reads.size(); ++page_idx) {
+    auto const& page_read = page_reads[page_idx];
+    auto const type_width = cudf::size_of(page_read.type);
     auto const& page = pages[page_idx];
     CUDF_EXPECTS(page.layout.bits_per_value == static_cast<std::uint64_t>(type_width * 8),
                  "Lance page encoding does not match schema type width");
@@ -1481,6 +1495,7 @@ void read_dense_pages_values_into(datasource* source,
       header_ptrs.push_back(page_data + static_cast<std::size_t>(header_offset));
       reads.push_back(dense_miniblock_read{chunk,
                                            page_data,
+                                           page_read.output,
                                            page.buffer_sizes[1],
                                            static_cast<std::size_t>(header_offset),
                                            raw_size,
@@ -1516,7 +1531,7 @@ void read_dense_pages_values_into(datasource* source,
       if (read.compression == compression_type::NONE) {
         CUDF_EXPECTS(payload_size == read.raw_size,
                      "Uncompressed Lance MiniBlock has unexpected payload size");
-        CUDF_CUDA_TRY(cudaMemcpyAsync(output + read.output_offset,
+        CUDF_CUDA_TRY(cudaMemcpyAsync(read.output + read.output_offset,
                                       read.page_data + payload_offset,
                                       read.raw_size,
                                       cudaMemcpyDeviceToDevice,
@@ -1527,7 +1542,7 @@ void read_dense_pages_values_into(datasource* source,
       CUDF_EXPECTS(read.compression == compression_type::ZSTD, "Unsupported Lance page compression");
       inputs.push_back(device_span<std::uint8_t const>{read.page_data + payload_offset,
                                                        payload_size});
-      outputs.push_back(device_span<std::uint8_t>{output + read.output_offset, read.raw_size});
+      outputs.push_back(device_span<std::uint8_t>{read.output + read.output_offset, read.raw_size});
       output_sizes.push_back(read.raw_size);
       total_raw_size += read.raw_size;
       max_raw_size = std::max(max_raw_size, read.raw_size);
@@ -1538,6 +1553,21 @@ void read_dense_pages_values_into(datasource* source,
     decompress_zstd_device_batch_into(
       inputs, outputs, output_sizes, max_raw_size, total_raw_size, stream);
   }
+}
+
+void read_dense_pages_values_into(datasource* source,
+                                  std::vector<lance_page_info> const& pages,
+                                  data_type type,
+                                  std::uint8_t* output,
+                                  rmm::cuda_stream_view stream,
+                                  rmm::device_async_resource_ref mr)
+{
+  std::vector<dense_page_read> page_reads;
+  page_reads.reserve(pages.size());
+  for (auto const& page : pages) {
+    page_reads.push_back(dense_page_read{&page, type, output});
+  }
+  read_dense_page_values_into(source, page_reads, stream, mr);
 }
 
 std::vector<page_metadata> write_column_pages(
@@ -1826,6 +1856,37 @@ std::size_t find_page_for_row(std::vector<lance_page_info> const& pages, size_ty
   CUDF_FAIL("Lance row selection references a row without a data page");
 }
 
+bool should_use_dense_for_sparse_selection(lance_file_info const& file_info,
+                                           std::vector<size_type> const& columns,
+                                           std::vector<size_type> const& rows)
+{
+  if (columns.size() < 2 || rows.empty()) { return false; }
+
+  auto const& column_info = file_info.columns[columns.front()];
+  std::vector<std::uint64_t> page_miniblock_begins(column_info.pages.size());
+  std::uint64_t total_miniblocks = 0;
+  for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
+    auto const& page                 = column_info.pages[page_idx];
+    page_miniblock_begins[page_idx] = total_miniblocks;
+    auto const page_miniblock_count = (page.length + default_rows_per_miniblock - 1) /
+                                      default_rows_per_miniblock;
+    total_miniblocks += page_miniblock_count;
+  }
+  if (total_miniblocks == 0) { return false; }
+
+  std::unordered_set<std::uint64_t> selected_miniblocks;
+  selected_miniblocks.reserve(rows.size());
+  for (auto row : rows) {
+    auto const page_idx    = find_page_for_row(column_info.pages, row);
+    auto const& page       = column_info.pages[page_idx];
+    auto const row_in_page = static_cast<std::uint64_t>(row) - page.priority;
+    selected_miniblocks.insert(page_miniblock_begins[page_idx] +
+                               (row_in_page / default_rows_per_miniblock));
+  }
+
+  return selected_miniblocks.size() >= (total_miniblocks + 1) / 2;
+}
+
 std::size_t find_miniblock_chunk_for_row(std::vector<miniblock_chunk_info> const& chunks,
                                          size_type row)
 {
@@ -1874,6 +1935,67 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                "Lance page lengths do not match file row count");
   read_dense_pages_values_into(source, column_info.pages, field_type, output_data, stream, mr);
   return output;
+}
+
+std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
+                                                        lance_file_info const& file_info,
+                                                        std::vector<size_type> const& columns,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(file_info.num_rows <=
+                 static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
+               "Lance file contains too many rows for cuDF");
+
+  std::vector<std::unique_ptr<column>> output_columns;
+  output_columns.reserve(columns.size());
+
+  if (file_info.num_rows == 0) {
+    for (auto column_idx : columns) {
+      auto const& field = file_info.fields[column_idx];
+      CUDF_EXPECTS(field.type.has_value(),
+                   "Unsupported Lance column selected: " + field.name + " (" +
+                     field.unsupported_reason + ")");
+      output_columns.push_back(
+        cudf::make_fixed_width_column(*field.type, 0, mask_state::UNALLOCATED, stream, mr));
+    }
+    return output_columns;
+  }
+
+  std::vector<dense_page_read> page_reads;
+  for (auto column_idx : columns) {
+    auto const& field       = file_info.fields[column_idx];
+    auto const& column_info = file_info.columns[column_idx];
+    CUDF_EXPECTS(field.type.has_value(),
+                 "Unsupported Lance column selected: " + field.name + " (" +
+                   field.unsupported_reason + ")");
+    auto const field_type = *field.type;
+    auto output = cudf::make_fixed_width_column(field_type,
+                                                static_cast<size_type>(file_info.num_rows),
+                                                mask_state::UNALLOCATED,
+                                                stream,
+                                                mr);
+    auto* output_data = output->mutable_view().head<std::uint8_t>();
+
+    std::uint64_t next_row = 0;
+    for (auto const& page : column_info.pages) {
+      CUDF_EXPECTS(page.priority == next_row,
+                   "Lance pages are not contiguous for full-column read");
+      CUDF_EXPECTS(page.length <=
+                     static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
+                   "Lance page contains too many rows for cuDF");
+
+      next_row += page.length;
+      page_reads.push_back(dense_page_read{&page, field_type, output_data});
+    }
+
+    CUDF_EXPECTS(next_row == file_info.num_rows,
+                 "Lance page lengths do not match file row count");
+    output_columns.push_back(std::move(output));
+  }
+
+  read_dense_page_values_into(source, page_reads, stream, mr);
+  return output_columns;
 }
 
 std::unique_ptr<column> read_lance_column(datasource* source,
@@ -2169,22 +2291,44 @@ table_with_metadata read_lance(datasource* source,
                                                      : static_cast<std::size_t>(file_info.num_rows);
 
   std::vector<std::unique_ptr<column>> output_columns;
-  output_columns.reserve(columns.size());
-  for (auto column_idx : columns) {
-    output_columns.push_back(
-      options.has_row_selection()
-        ? read_lance_column(source,
-                            file_info.fields[column_idx],
-                            file_info.columns[column_idx],
-                            rows,
-                            stream,
-                            mr)
-        : read_lance_column(source,
-                            file_info.fields[column_idx],
-                            file_info.columns[column_idx],
-                            file_info.num_rows,
-                            stream,
-                            mr));
+  if (options.has_row_selection()) {
+    if (should_use_dense_for_sparse_selection(file_info, columns, rows)) {
+      auto dense_columns = read_lance_columns(source, file_info, columns, stream, mr);
+      auto source_map    = cudf::detail::make_device_uvector(rows, stream, mr);
+      std::vector<size_type> target_rows(rows.size());
+      std::iota(target_rows.begin(), target_rows.end(), 0);
+      auto target_map = cudf::detail::make_device_uvector(target_rows, stream, mr);
+
+      output_columns.reserve(dense_columns.size());
+      for (auto& dense_column : dense_columns) {
+        auto const field_type = dense_column->type();
+        auto output = cudf::make_fixed_width_column(field_type,
+                                                    static_cast<size_type>(rows.size()),
+                                                    mask_state::UNALLOCATED,
+                                                    stream,
+                                                    mr);
+        copy_sparse_fixed_width(dense_column->view().head<std::uint8_t>(),
+                                output->mutable_view().head<std::uint8_t>(),
+                                source_map.data(),
+                                target_map.data(),
+                                static_cast<size_type>(source_map.size()),
+                                cudf::size_of(field_type),
+                                stream);
+        output_columns.push_back(std::move(output));
+      }
+    } else {
+      output_columns.reserve(columns.size());
+      for (auto column_idx : columns) {
+        output_columns.push_back(read_lance_column(source,
+                                                   file_info.fields[column_idx],
+                                                   file_info.columns[column_idx],
+                                                   rows,
+                                                   stream,
+                                                   mr));
+      }
+    }
+  } else {
+    output_columns = read_lance_columns(source, file_info, columns, stream, mr);
   }
 
   table_with_metadata result;
