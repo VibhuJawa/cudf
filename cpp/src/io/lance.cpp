@@ -2087,6 +2087,34 @@ bool can_batch_sparse_zstd_columns(lance_file_info const& file_info,
   return true;
 }
 
+bool should_batch_single_column_sparse_selection(lance_file_info const& file_info,
+                                                 size_type column_idx,
+                                                 std::vector<size_type> const& rows)
+{
+  if (rows.size() < sparse_header_batch_min_reads) { return false; }
+
+  auto const [min_row, max_row] = std::minmax_element(rows.begin(), rows.end());
+  auto const row_span =
+    static_cast<std::uint64_t>(*max_row) - static_cast<std::uint64_t>(*min_row);
+  if (row_span < (sparse_header_batch_min_reads - 1) * default_rows_per_page) {
+    return false;
+  }
+
+  auto const& column_info = file_info.columns[column_idx];
+  std::vector<std::uint8_t> selected_pages(column_info.pages.size(), 0);
+  std::size_t selected_page_count = 0;
+  for (auto row : rows) {
+    auto const page_idx = find_page_for_row(column_info.pages, row);
+    if (selected_pages[page_idx] == 0) {
+      selected_pages[page_idx] = 1;
+      ++selected_page_count;
+      if (selected_page_count >= sparse_header_batch_min_reads) { return true; }
+    }
+  }
+
+  return false;
+}
+
 bool have_same_page_rows(lance_column_info const& lhs, lance_column_info const& rhs)
 {
   if (lhs.pages.size() != rhs.pages.size()) { return false; }
@@ -3014,6 +3042,10 @@ table_with_metadata read_lance(datasource* source,
     } else {
       output_columns.reserve(columns.size());
       if (columns.size() > 1 && can_batch_sparse_zstd_columns(file_info, columns)) {
+        output_columns = read_lance_columns(source, file_info, columns, rows, stream, mr);
+      } else if (columns.size() == 1 &&
+                 should_batch_single_column_sparse_selection(file_info, columns.front(), rows) &&
+                 can_batch_sparse_zstd_columns(file_info, columns)) {
         output_columns = read_lance_columns(source, file_info, columns, rows, stream, mr);
       } else {
         for (auto column_idx : columns) {
