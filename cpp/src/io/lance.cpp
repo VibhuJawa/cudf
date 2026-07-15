@@ -120,9 +120,12 @@ constexpr std::size_t sparse_page_selected_span_min_chunks = 4;
 constexpr std::size_t sparse_stack_miniblock_count = 64;
 constexpr std::size_t sparse_page_span_min_pages = 16;
 constexpr std::size_t sparse_page_span_min_chunks_per_page = 2;
+constexpr std::size_t sparse_dense_min_rows_per_page = 4;
 constexpr std::uint64_t sparse_page_span_max_bytes = std::uint64_t{64} << 20;
 constexpr std::uint64_t sparse_page_span_max_overread_ratio = 2;
 constexpr std::uint64_t sparse_page_selected_span_max_overread_ratio = 4;
+constexpr std::size_t sparse_page_dense_selected_span_min_chunks_per_page = 8;
+constexpr std::uint64_t sparse_page_dense_selected_span_max_overread_ratio = 8;
 constexpr std::size_t sparse_host_staging_min_reads = 32;
 constexpr std::uint64_t sparse_host_staging_max_read_bytes = std::uint64_t{256} << 10;
 constexpr std::uint64_t sparse_host_staging_max_total_bytes = std::uint64_t{64} << 20;
@@ -2353,13 +2356,18 @@ std::size_t find_page_for_row(std::vector<lance_page_info> const& pages, size_ty
   CUDF_FAIL("Lance row selection references a row without a data page");
 }
 
-bool should_use_dense_for_sparse_selection(lance_file_info const& file_info,
+bool should_use_dense_for_sparse_selection(datasource* source,
+                                           lance_file_info const& file_info,
                                            std::vector<size_type> const& columns,
                                            std::vector<size_type> const& rows)
 {
   if (columns.size() < 2 || rows.empty()) { return false; }
 
   auto const& column_info = file_info.columns[columns.front()];
+  if (rows.size() < column_info.pages.size() * sparse_dense_min_rows_per_page) {
+    return false;
+  }
+
   std::vector<std::uint64_t> page_miniblock_begins(column_info.pages.size());
   std::uint64_t total_miniblocks = 0;
   for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
@@ -2380,22 +2388,53 @@ bool should_use_dense_for_sparse_selection(lance_file_info const& file_info,
   auto const max_span_miniblocks = (row_span / default_rows_per_miniblock) + 1;
   if (max_span_miniblocks < dense_miniblock_threshold) { return false; }
 
+  auto chunks_by_page = read_miniblock_chunks(source, column_info.pages);
+  total_miniblocks    = 0;
+  auto total_data_buffer_size = std::uint64_t{0};
+  for (std::size_t page_idx = 0; page_idx < chunks_by_page.size(); ++page_idx) {
+    page_miniblock_begins[page_idx] = total_miniblocks;
+    total_miniblocks += chunks_by_page[page_idx].size();
+    for (auto const& chunk : chunks_by_page[page_idx]) {
+      total_data_buffer_size += chunk.buffer_size;
+    }
+  }
+  if (total_miniblocks == 0 || total_data_buffer_size == 0) { return false; }
+
+  auto const dense_actual_miniblock_threshold = (total_miniblocks + 1) / 2;
+  if (static_cast<std::uint64_t>(rows.size()) < dense_actual_miniblock_threshold) {
+    return false;
+  }
+
   CUDF_EXPECTS(total_miniblocks <=
                  static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
                "Lance file contains too many MiniBlocks");
   std::vector<std::uint8_t> selected_miniblocks(static_cast<std::size_t>(total_miniblocks), 0);
   std::uint64_t selected_miniblock_count = 0;
+  auto selected_data_buffer_size         = std::uint64_t{0};
   for (auto row : rows) {
     auto const page_idx    = find_page_for_row(column_info.pages, row);
     auto const& page       = column_info.pages[page_idx];
     auto const row_in_page = static_cast<std::uint64_t>(row) - page.priority;
-    auto const miniblock_idx = page_miniblock_begins[page_idx] +
-                               (row_in_page / default_rows_per_miniblock);
+    auto const& chunks     = chunks_by_page[page_idx];
+    auto const found = std::upper_bound(
+      chunks.begin(), chunks.end(), row_in_page, [](auto value, auto const& chunk) {
+        return value < chunk.row_begin;
+      });
+    CUDF_EXPECTS(found != chunks.begin(),
+                 "Lance row selection references a row without a MiniBlock chunk");
+    auto const chunk_idx = static_cast<std::size_t>(std::distance(chunks.begin(), found - 1));
+    CUDF_EXPECTS(row_in_page < chunks[chunk_idx].row_begin + chunks[chunk_idx].num_rows,
+                 "Lance row selection references a row without a MiniBlock chunk");
+    auto const miniblock_idx = page_miniblock_begins[page_idx] + chunk_idx;
     auto& selected = selected_miniblocks[static_cast<std::size_t>(miniblock_idx)];
     if (selected == 0) {
       selected = 1;
+      selected_data_buffer_size += chunks[chunk_idx].buffer_size;
       ++selected_miniblock_count;
-      if (selected_miniblock_count >= dense_miniblock_threshold) { return true; }
+      if (selected_miniblock_count >= dense_actual_miniblock_threshold &&
+          selected_data_buffer_size >= (total_data_buffer_size + 1) / 2) {
+        return true;
+      }
     }
   }
 
@@ -3095,6 +3134,11 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       selected_input_sizes_by_page.assign(column_info.pages.size(), 0);
       selected_span_offsets_by_page.assign(column_info.pages.size(), 0);
       use_selected_span_by_page.assign(column_info.pages.size(), 0);
+      auto const selected_span_max_overread_ratio =
+        selected_miniblock_count >=
+            touched_page_indices.size() * sparse_page_dense_selected_span_min_chunks_per_page
+          ? sparse_page_dense_selected_span_max_overread_ratio
+          : sparse_page_selected_span_max_overread_ratio;
 
       for (auto page_idx : touched_page_indices) {
         auto const& page   = column_info.pages[page_idx];
@@ -3121,8 +3165,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         if (selected_chunk_count >= sparse_page_selected_span_min_chunks) {
           auto const span_size = span_end - span_begin;
           if (span_size <= page.buffer_sizes[1] &&
-              (span_size + sparse_page_selected_span_max_overread_ratio - 1) /
-                  sparse_page_selected_span_max_overread_ratio <=
+              (span_size + selected_span_max_overread_ratio - 1) /
+                  selected_span_max_overread_ratio <=
                 page_selected_buffer_size) {
             use_selected_span_by_page[page_idx]     = 1;
             selected_span_offsets_by_page[page_idx] = span_begin;
@@ -3754,7 +3798,7 @@ table_with_metadata read_lance(datasource* source,
 
   std::vector<std::unique_ptr<column>> output_columns;
   if (options.has_row_selection()) {
-    if (should_use_dense_for_sparse_selection(file_info, columns, rows)) {
+    if (should_use_dense_for_sparse_selection(source, file_info, columns, rows)) {
       auto dense_columns = read_lance_columns(source, file_info, columns, stream, mr);
       auto source_map    = cudf::detail::make_device_uvector(rows, stream, mr);
       std::vector<size_type> target_rows(rows.size());
