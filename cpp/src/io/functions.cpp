@@ -1293,6 +1293,10 @@ packed_table read_cudftable(datasource* source,
 void write_lance(data_sink* sink,
                  lance_writer_options const& options,
                  rmm::cuda_stream_view stream);
+table_with_metadata read_lance(datasource* source,
+                               lance_reader_options const& options,
+                               rmm::cuda_stream_view stream,
+                               rmm::device_async_resource_ref mr);
 }  // namespace detail
 
 /**
@@ -1334,6 +1338,21 @@ void write_lance(lance_writer_options const& options, rmm::cuda_stream_view stre
   CUDF_EXPECTS(sinks.size() == 1, "Lance writer only supports single sink");
 
   detail::write_lance(sinks[0].get(), options, stream);
+}
+
+/**
+ * @copydoc cudf::io::experimental::read_lance
+ */
+table_with_metadata read_lance(lance_reader_options const& options,
+                               rmm::cuda_stream_view stream,
+                               rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+
+  auto datasources = make_datasources(options.get_source());
+  CUDF_EXPECTS(datasources.size() == 1, "Lance reader only supports single source");
+
+  return detail::read_lance(datasources[0].get(), options, stream, mr);
 }
 
 }  // namespace experimental

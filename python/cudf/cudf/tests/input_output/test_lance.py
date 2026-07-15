@@ -4,6 +4,7 @@
 import pytest
 
 import cudf
+from cudf.testing import assert_eq
 
 
 def _assert_lance_footer(data: bytes):
@@ -36,6 +37,23 @@ def test_to_lance_uncompressed_writer_footer(tmp_path):
     _assert_lance_footer(path.read_bytes())
 
 
+def test_read_lance_sparse_rows_and_columns(tmp_path):
+    df = cudf.DataFrame(
+        {
+            "key": [1, 2, 3, 4, 5, 6, 7, 8],
+            "value": [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5],
+            "offset": [10, 20, 30, 40, 50, 60, 70, 80],
+        }
+    )
+
+    path = tmp_path / "sparse.lance"
+    df.to_lance(path, compression="NONE", max_rows_per_page=3)
+
+    got = cudf.read_lance(path, columns=["value", "key"], rows=[4, 1, 6])
+    expect = cudf.DataFrame({"value": [4.5, 1.5, 6.5], "key": [5, 2, 7]})
+    assert_eq(expect, got)
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -63,3 +81,12 @@ def test_to_lance_rejects_invalid_page_rows(tmp_path):
 
     with pytest.raises(ValueError, match="max_rows_per_page"):
         df.to_lance(tmp_path / "invalid_page_rows.lance", max_rows_per_page=0)
+
+
+def test_read_lance_rejects_invalid_rows(tmp_path):
+    df = cudf.DataFrame({"key": [1, 2, 3]})
+    path = tmp_path / "invalid_rows.lance"
+    df.to_lance(path, compression="NONE")
+
+    with pytest.raises(ValueError, match="non-negative"):
+        cudf.read_lance(path, rows=[0, -1])

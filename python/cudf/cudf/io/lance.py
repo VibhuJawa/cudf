@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from io import BytesIO
 import itertools
+import operator
 from typing import Literal
 
 import pylibcudf as plc
@@ -68,6 +70,76 @@ def _validate_lance_columns(columns, names):
                 "Lance writer currently supports only non-null columns; "
                 f"column {name!r} contains null values"
             )
+
+
+def _normalize_lance_read_columns(columns):
+    if columns is None:
+        return None
+    if isinstance(columns, str):
+        return [columns]
+    return [str(column) for column in columns]
+
+
+def _normalize_lance_rows(rows):
+    if rows is None:
+        return None
+    if isinstance(rows, (str, bytes)):
+        raise TypeError("rows must be a sequence of integer row ids")
+
+    try:
+        iterator = iter(rows)
+    except TypeError as exc:
+        raise TypeError("rows must be a sequence of integer row ids") from exc
+
+    row_ids = []
+    for row in iterator:
+        if isinstance(row, bool):
+            raise TypeError("rows must contain integer row ids")
+        try:
+            row_id = operator.index(row)
+        except TypeError as exc:
+            raise TypeError("rows must contain integer row ids") from exc
+        if row_id < 0:
+            raise ValueError("rows must contain non-negative row ids")
+        row_ids.append(row_id)
+    return row_ids
+
+
+def read_lance(
+    filepath_or_buffer,
+    columns=None,
+    rows=None,
+    storage_options=None,
+    bytes_per_thread=None,
+) -> DataFrame:
+    """Read a Lance data file using libcudf.
+
+    This experimental reader currently supports the non-null top-level integer
+    and floating-point Lance files emitted by :func:`to_lance`. If ``rows`` is
+    supplied, libcudf reads only pages containing those zero-based row ids and
+    returns rows in the supplied order.
+    """
+    path_or_buf = ioutils.get_reader_filepath_or_buffer(
+        path_or_data=filepath_or_buffer,
+        iotypes=(BytesIO,),
+        storage_options=storage_options,
+        bytes_per_thread=bytes_per_thread,
+    )
+    path_or_buf = ioutils._select_single_source(path_or_buf, "read_lance")
+
+    column_names = _normalize_lance_read_columns(columns)
+    row_ids = _normalize_lance_rows(rows)
+    builder = plc.io.experimental.LanceReaderOptions.builder(
+        plc.io.SourceInfo([path_or_buf])
+    )
+    if column_names is not None:
+        builder.columns(column_names)
+    if row_ids is not None:
+        builder.rows(row_ids)
+
+    return DataFrame.from_pylibcudf(
+        plc.io.experimental.read_lance(builder.build())
+    )
 
 
 def to_lance(

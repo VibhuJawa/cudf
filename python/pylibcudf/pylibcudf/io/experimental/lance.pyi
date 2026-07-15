@@ -3,9 +3,25 @@
 
 from typing import Self
 
-from pylibcudf.io.types import CompressionType, SinkInfo, TableWithMetadata
+from rmm.pylibrmm.memory_resource import DeviceMemoryResource
+
+from pylibcudf.io.types import (
+    CompressionType,
+    SinkInfo,
+    SourceInfo,
+    TableWithMetadata,
+)
 from pylibcudf.table import Table
 from pylibcudf.utils import CudaStreamLike
+
+class LanceReaderOptions:
+    @staticmethod
+    def builder(source: SourceInfo) -> LanceReaderOptionsBuilder: ...
+
+class LanceReaderOptionsBuilder:
+    def columns(self, col_names: list[str]) -> Self: ...
+    def rows(self, row_indices: list[int]) -> Self: ...
+    def build(self) -> LanceReaderOptions: ...
 
 class LanceWriterOptions:
     @staticmethod
@@ -20,3 +36,9 @@ class LanceWriterOptionsBuilder:
 def write_lance(
     options: LanceWriterOptions, stream: CudaStreamLike | None = None
 ) -> None: ...
+
+def read_lance(
+    options: LanceReaderOptions,
+    stream: CudaStreamLike | None = None,
+    mr: DeviceMemoryResource | None = None,
+) -> TableWithMetadata: ...
