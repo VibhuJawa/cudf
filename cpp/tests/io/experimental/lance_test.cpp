@@ -53,6 +53,12 @@ TEST_F(LanceWriterTest, WritesDefaultZstdFileFooter)
   EXPECT_EQ(read_u16_le(buffer, buffer.size() - 8), 2);
   EXPECT_EQ(read_u16_le(buffer, buffer.size() - 6), 2);
   EXPECT_EQ(std::string(buffer.end() - 4, buffer.end()), "LANC");
+
+  auto read_options = cudf::io::experimental::lance_reader_options::builder(
+                        cudf::io::source_info{cudf::host_span<char>{buffer.data(), buffer.size()}})
+                        .build();
+  auto result = cudf::io::experimental::read_lance(read_options);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(table, result.tbl->view());
 }
 
 TEST_F(LanceWriterTest, ReadsSparseRowsFromSelectedColumns)
@@ -79,12 +85,12 @@ TEST_F(LanceWriterTest, ReadsSparseRowsFromSelectedColumns)
   auto read_options = cudf::io::experimental::lance_reader_options::builder(
                         cudf::io::source_info{cudf::host_span<char>{buffer.data(), buffer.size()}})
                         .columns({"value", "key"})
-                        .rows({4, 1, 6})
+                        .rows({4, 1, 4, 6})
                         .build();
   auto result = cudf::io::experimental::read_lance(read_options);
 
-  cudf::test::fixed_width_column_wrapper<double> expected_values({4.5, 1.5, 6.5});
-  cudf::test::fixed_width_column_wrapper<int32_t> expected_keys({5, 2, 7});
+  cudf::test::fixed_width_column_wrapper<double> expected_values({4.5, 1.5, 4.5, 6.5});
+  cudf::test::fixed_width_column_wrapper<int32_t> expected_keys({5, 2, 5, 7});
   cudf::table_view expected({expected_values, expected_keys});
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
@@ -92,7 +98,64 @@ TEST_F(LanceWriterTest, ReadsSparseRowsFromSelectedColumns)
   EXPECT_EQ(result.metadata.schema_info[0].name, "value");
   EXPECT_EQ(result.metadata.schema_info[1].name, "key");
   ASSERT_EQ(result.metadata.num_rows_per_source.size(), 1);
-  EXPECT_EQ(result.metadata.num_rows_per_source[0], 3);
+  EXPECT_EQ(result.metadata.num_rows_per_source[0], 4);
+}
+
+TEST_F(LanceWriterTest, ReadsAllRowsWithoutSparseSelection)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> keys({1, 2, 3, 4, 5, 6, 7, 8});
+  cudf::test::fixed_width_column_wrapper<double> values({0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5});
+  cudf::table_view table({keys, values});
+
+  cudf::io::table_metadata metadata;
+  metadata.schema_info.push_back(cudf::io::column_name_info{"key", {}});
+  metadata.schema_info.push_back(cudf::io::column_name_info{"value", {}});
+
+  std::vector<char> buffer;
+  auto write_options = cudf::io::experimental::lance_writer_options::builder(
+                         cudf::io::sink_info{&buffer}, table)
+                         .metadata(std::move(metadata))
+                         .compression(cudf::io::compression_type::NONE)
+                         .max_rows_per_page(3)
+                         .build();
+  cudf::io::experimental::write_lance(write_options);
+
+  auto read_options = cudf::io::experimental::lance_reader_options::builder(
+                        cudf::io::source_info{cudf::host_span<char>{buffer.data(), buffer.size()}})
+                        .build();
+  auto result = cudf::io::experimental::read_lance(read_options);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(table, result.tbl->view());
+  ASSERT_EQ(result.metadata.schema_info.size(), 2);
+  EXPECT_EQ(result.metadata.schema_info[0].name, "key");
+  EXPECT_EQ(result.metadata.schema_info[1].name, "value");
+  ASSERT_EQ(result.metadata.num_rows_per_source.size(), 1);
+  EXPECT_EQ(result.metadata.num_rows_per_source[0], 8);
+}
+
+TEST_F(LanceWriterTest, ReadsEmptySparseSelection)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> keys({1, 2, 3});
+  cudf::table_view table({keys});
+
+  std::vector<char> buffer;
+  auto write_options = cudf::io::experimental::lance_writer_options::builder(
+                         cudf::io::sink_info{&buffer}, table)
+                         .compression(cudf::io::compression_type::NONE)
+                         .build();
+  cudf::io::experimental::write_lance(write_options);
+
+  auto read_options = cudf::io::experimental::lance_reader_options::builder(
+                        cudf::io::source_info{cudf::host_span<char>{buffer.data(), buffer.size()}})
+                        .rows({})
+                        .build();
+  auto result = cudf::io::experimental::read_lance(read_options);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> expected_keys({});
+  cudf::table_view expected({expected_keys});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
+  ASSERT_EQ(result.metadata.num_rows_per_source.size(), 1);
+  EXPECT_EQ(result.metadata.num_rows_per_source[0], 0);
 }
 
 TEST_F(LanceWriterTest, RejectsUnsupportedCompression)

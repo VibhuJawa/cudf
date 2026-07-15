@@ -26,6 +26,7 @@ def test_to_lance_writer_footer(tmp_path):
     df.to_lance(path, max_rows_per_page=2)
 
     _assert_lance_footer(path.read_bytes())
+    assert_eq(df, cudf.read_lance(path))
 
 
 def test_to_lance_uncompressed_writer_footer(tmp_path):
@@ -49,8 +50,36 @@ def test_read_lance_sparse_rows_and_columns(tmp_path):
     path = tmp_path / "sparse.lance"
     df.to_lance(path, compression="NONE", max_rows_per_page=3)
 
-    got = cudf.read_lance(path, columns=["value", "key"], rows=[4, 1, 6])
-    expect = cudf.DataFrame({"value": [4.5, 1.5, 6.5], "key": [5, 2, 7]})
+    got = cudf.read_lance(path, columns=["value", "key"], rows=[4, 1, 4, 6])
+    expect = cudf.DataFrame(
+        {"value": [4.5, 1.5, 4.5, 6.5], "key": [5, 2, 5, 7]}
+    )
+    assert_eq(expect, got)
+
+
+def test_read_lance_all_rows(tmp_path):
+    df = cudf.DataFrame(
+        {
+            "key": [1, 2, 3, 4, 5, 6, 7, 8],
+            "value": [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5],
+        }
+    )
+
+    path = tmp_path / "all_rows.lance"
+    df.to_lance(path, compression="NONE", max_rows_per_page=3)
+
+    got = cudf.read_lance(path)
+    assert_eq(df, got)
+
+
+def test_read_lance_empty_sparse_rows(tmp_path):
+    df = cudf.DataFrame({"key": [1, 2, 3]})
+
+    path = tmp_path / "empty_sparse.lance"
+    df.to_lance(path, compression="NONE")
+
+    got = cudf.read_lance(path, rows=[])
+    expect = cudf.DataFrame({"key": cudf.Series([], dtype=df["key"].dtype)})
     assert_eq(expect, got)
 
 

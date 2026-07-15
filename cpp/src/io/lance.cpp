@@ -7,8 +7,9 @@
 #include "io/comp/nvcomp_adapter.hpp"
 #include "io/utilities/hostdevice_vector.hpp"
 
-#include <cudf/detail/nvtx/ranges.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/detail/gather.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/scatter.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
@@ -1019,6 +1020,15 @@ std::vector<std::uint8_t> make_miniblock_metadata(std::uint64_t miniblock_buffer
   return metadata;
 }
 
+std::uint64_t parse_miniblock_metadata(std::vector<std::uint8_t> const& metadata)
+{
+  CUDF_EXPECTS(metadata.size() == sizeof(std::uint32_t),
+               "Only single-chunk Lance MiniBlock metadata is supported");
+  auto const metadata_word = read_little_endian_u32(metadata.data());
+  CUDF_EXPECTS((metadata_word & 0xf) == 0, "Unsupported Lance MiniBlock metadata log entries");
+  return ((static_cast<std::uint64_t>(metadata_word) >> 4) + 1) * 8;
+}
+
 struct compressed_buffer {
   rmm::device_uvector<std::uint8_t> data;
   std::size_t bytes_written{};
@@ -1131,6 +1141,10 @@ rmm::device_uvector<std::uint8_t> read_page_values(datasource* source,
                "Lance page is too large to read");
   CUDF_EXPECTS(page.layout.bits_per_value == static_cast<std::uint64_t>(type_width * 8),
                "Lance page encoding does not match schema type width");
+  auto const miniblock_size =
+    parse_miniblock_metadata(read_host_bytes(source, page.buffer_offsets[0], page.buffer_sizes[0]));
+  CUDF_EXPECTS(miniblock_size == page.buffer_sizes[1],
+               "Lance MiniBlock metadata does not match data buffer size");
   CUDF_EXPECTS(page.buffer_sizes[1] >= miniblock_header_size,
                "Invalid Lance MiniBlock data buffer");
 
@@ -1363,6 +1377,50 @@ std::size_t find_page_for_row(std::vector<lance_page_info> const& pages, size_ty
 std::unique_ptr<column> read_lance_column(datasource* source,
                                           lance_field_info const& field,
                                           lance_column_info const& column_info,
+                                          std::uint64_t num_rows,
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(num_rows <= static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
+               "Lance file contains too many rows for cuDF");
+  if (num_rows == 0) {
+    return cudf::make_fixed_width_column(
+      field.type, 0, mask_state::UNALLOCATED, stream, mr);
+  }
+
+  std::vector<std::unique_ptr<column>> page_columns;
+  std::vector<column_view> page_views;
+  page_columns.reserve(column_info.pages.size());
+  page_views.reserve(column_info.pages.size());
+
+  std::uint64_t next_row = 0;
+  for (auto const& page : column_info.pages) {
+    CUDF_EXPECTS(page.priority == next_row,
+                 "Lance pages are not contiguous for full-column read");
+    CUDF_EXPECTS(page.length <=
+                   static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
+                 "Lance page contains too many rows for cuDF");
+
+    auto page_values = read_page_values(source, page, field.type, stream, mr);
+    auto page_column = std::make_unique<column>(field.type,
+                                                static_cast<size_type>(page.length),
+                                                page_values.release(),
+                                                rmm::device_buffer{},
+                                                0);
+    page_views.push_back(page_column->view());
+    page_columns.push_back(std::move(page_column));
+    next_row += page.length;
+  }
+
+  CUDF_EXPECTS(next_row == num_rows,
+               "Lance page lengths do not match file row count");
+  if (page_columns.size() == 1) { return std::move(page_columns.front()); }
+  return cudf::concatenate(page_views, stream, mr);
+}
+
+std::unique_ptr<column> read_lance_column(datasource* source,
+                                          lance_field_info const& field,
+                                          lance_column_info const& column_info,
                                           std::vector<size_type> const& rows,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
@@ -1490,23 +1548,34 @@ table_with_metadata read_lance(datasource* source,
   CUDF_FUNC_RANGE();
 
   auto const file_info = read_lance_file_info(source);
-  auto const rows      = selected_rows(file_info, options);
   auto const columns   = selected_columns(file_info, options);
+  auto const rows      = options.has_row_selection() ? selected_rows(file_info, options)
+                                                     : std::vector<size_type>{};
+  auto const num_rows  = options.has_row_selection() ? rows.size()
+                                                     : static_cast<std::size_t>(file_info.num_rows);
 
   std::vector<std::unique_ptr<column>> output_columns;
   output_columns.reserve(columns.size());
   for (auto column_idx : columns) {
-    output_columns.push_back(read_lance_column(source,
-                                               file_info.fields[column_idx],
-                                               file_info.columns[column_idx],
-                                               rows,
-                                               stream,
-                                               mr));
+    output_columns.push_back(
+      options.has_row_selection()
+        ? read_lance_column(source,
+                            file_info.fields[column_idx],
+                            file_info.columns[column_idx],
+                            rows,
+                            stream,
+                            mr)
+        : read_lance_column(source,
+                            file_info.fields[column_idx],
+                            file_info.columns[column_idx],
+                            file_info.num_rows,
+                            stream,
+                            mr));
   }
 
   table_with_metadata result;
   result.tbl      = std::make_unique<table>(std::move(output_columns));
-  result.metadata = make_table_metadata(file_info, columns, rows.size());
+  result.metadata = make_table_metadata(file_info, columns, num_rows);
   return result;
 }
 
