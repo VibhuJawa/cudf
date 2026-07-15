@@ -1994,6 +1994,18 @@ bool can_batch_sparse_zstd_columns(lance_file_info const& file_info,
   return true;
 }
 
+bool have_same_page_rows(lance_column_info const& lhs, lance_column_info const& rhs)
+{
+  if (lhs.pages.size() != rhs.pages.size()) { return false; }
+  for (std::size_t idx = 0; idx < lhs.pages.size(); ++idx) {
+    if (lhs.pages[idx].priority != rhs.pages[idx].priority ||
+        lhs.pages[idx].length != rhs.pages[idx].length) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::size_t find_miniblock_chunk_for_row(std::vector<miniblock_chunk_info> const& chunks,
                                          size_type row)
 {
@@ -2350,6 +2362,13 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   for (auto column_idx : columns) {
     total_pages += file_info.columns[column_idx].pages.size();
   }
+  auto const can_share_page_rows = std::all_of(columns.begin() + 1,
+                                               columns.end(),
+                                               [&](auto column_idx) {
+                                                 return have_same_page_rows(
+                                                   file_info.columns[columns.front()],
+                                                   file_info.columns[column_idx]);
+                                               });
 
   std::vector<rmm::device_uvector<std::uint8_t>> page_value_buffers;
   std::vector<rmm::device_uvector<std::uint8_t>> input_buffers;
@@ -2368,6 +2387,36 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   std::size_t total_raw_size = 0;
   std::size_t max_raw_size   = 0;
 
+  std::vector<std::vector<std::pair<size_type, size_type>>> shared_rows_by_page;
+  std::vector<std::size_t> shared_row_map_indices;
+  if (can_share_page_rows) {
+    auto const& pages = file_info.columns[columns.front()].pages;
+    shared_rows_by_page.resize(pages.size());
+    shared_row_map_indices.resize(pages.size(), std::numeric_limits<std::size_t>::max());
+    for (size_type output_row = 0; output_row < static_cast<size_type>(rows.size());
+         ++output_row) {
+      auto const page_idx = find_page_for_row(pages, rows[output_row]);
+      auto const& page    = pages[page_idx];
+      auto const row_in_page =
+        static_cast<size_type>(static_cast<std::uint64_t>(rows[output_row]) - page.priority);
+      shared_rows_by_page[page_idx].emplace_back(output_row, row_in_page);
+    }
+    for (std::size_t page_idx = 0; page_idx < shared_rows_by_page.size(); ++page_idx) {
+      if (shared_rows_by_page[page_idx].empty()) { continue; }
+      std::vector<size_type> source_rows;
+      std::vector<size_type> target_rows;
+      source_rows.reserve(shared_rows_by_page[page_idx].size());
+      target_rows.reserve(shared_rows_by_page[page_idx].size());
+      for (auto const& [output_row, row_in_page] : shared_rows_by_page[page_idx]) {
+        target_rows.push_back(output_row);
+        source_rows.push_back(row_in_page);
+      }
+      shared_row_map_indices[page_idx] = source_rows_by_page.size();
+      source_rows_by_page.push_back(std::move(source_rows));
+      target_rows_by_page.push_back(std::move(target_rows));
+    }
+  }
+
   for (auto column_idx : columns) {
     auto const& field       = file_info.fields[column_idx];
     auto const& column_info = file_info.columns[column_idx];
@@ -2377,16 +2426,21 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     auto const field_type = *field.type;
     auto const type_width = cudf::size_of(field_type);
 
-    std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_page(
-      column_info.pages.size());
-    for (size_type output_row = 0; output_row < static_cast<size_type>(rows.size());
-         ++output_row) {
-      auto const page_idx = find_page_for_row(column_info.pages, rows[output_row]);
-      auto const& page    = column_info.pages[page_idx];
-      auto const row_in_page =
-        static_cast<size_type>(static_cast<std::uint64_t>(rows[output_row]) - page.priority);
-      rows_by_page[page_idx].emplace_back(output_row, row_in_page);
+    std::vector<std::vector<std::pair<size_type, size_type>>> local_rows_by_page;
+    auto const* rows_by_page_ptr = &shared_rows_by_page;
+    if (!can_share_page_rows) {
+      local_rows_by_page.resize(column_info.pages.size());
+      for (size_type output_row = 0; output_row < static_cast<size_type>(rows.size());
+           ++output_row) {
+        auto const page_idx = find_page_for_row(column_info.pages, rows[output_row]);
+        auto const& page    = column_info.pages[page_idx];
+        auto const row_in_page =
+          static_cast<size_type>(static_cast<std::uint64_t>(rows[output_row]) - page.priority);
+        local_rows_by_page[page_idx].emplace_back(output_row, row_in_page);
+      }
+      rows_by_page_ptr = &local_rows_by_page;
     }
+    auto const& rows_by_page = *rows_by_page_ptr;
 
     std::uint64_t total_data_buffer_size    = 0;
     std::uint64_t selected_data_buffer_size = 0;
@@ -2550,17 +2604,24 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         }
       }
 
-      std::vector<size_type> source_rows;
-      std::vector<size_type> target_rows;
-      source_rows.reserve(rows_by_page[page_idx].size());
-      target_rows.reserve(rows_by_page[page_idx].size());
-      for (auto const& [output_row, row_in_page] : rows_by_page[page_idx]) {
-        target_rows.push_back(output_row);
-        source_rows.push_back(row_in_page);
+      std::size_t row_map_idx{};
+      if (can_share_page_rows) {
+        row_map_idx = shared_row_map_indices[page_idx];
+        CUDF_EXPECTS(row_map_idx != std::numeric_limits<std::size_t>::max(),
+                     "Missing shared Lance sparse row map");
+      } else {
+        std::vector<size_type> source_rows;
+        std::vector<size_type> target_rows;
+        source_rows.reserve(rows_by_page[page_idx].size());
+        target_rows.reserve(rows_by_page[page_idx].size());
+        for (auto const& [output_row, row_in_page] : rows_by_page[page_idx]) {
+          target_rows.push_back(output_row);
+          source_rows.push_back(row_in_page);
+        }
+        row_map_idx = source_rows_by_page.size();
+        source_rows_by_page.push_back(std::move(source_rows));
+        target_rows_by_page.push_back(std::move(target_rows));
       }
-      auto const row_map_idx = source_rows_by_page.size();
-      source_rows_by_page.push_back(std::move(source_rows));
-      target_rows_by_page.push_back(std::move(target_rows));
       page_copies.push_back(sparse_page_copy{page_values, output_data, row_map_idx, type_width});
     }
   }
@@ -2570,20 +2631,27 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       inputs, outputs, output_sizes, max_raw_size, total_raw_size, stream);
   }
 
-  for (auto const& copy : page_copies) {
-    auto source_map = cudf::detail::make_device_uvector(source_rows_by_page[copy.row_map_idx],
-                                                        stream,
-                                                        mr);
-    auto target_map = cudf::detail::make_device_uvector(target_rows_by_page[copy.row_map_idx],
-                                                        stream,
-                                                        mr);
-    copy_sparse_fixed_width(copy.page_values,
-                            copy.output,
-                            source_map.data(),
-                            target_map.data(),
-                            static_cast<size_type>(source_map.size()),
-                            copy.type_width,
-                            stream);
+  if (!page_copies.empty()) {
+    std::vector<rmm::device_uvector<size_type>> source_maps;
+    std::vector<rmm::device_uvector<size_type>> target_maps;
+    source_maps.reserve(source_rows_by_page.size());
+    target_maps.reserve(target_rows_by_page.size());
+    for (std::size_t idx = 0; idx < source_rows_by_page.size(); ++idx) {
+      source_maps.push_back(
+        cudf::detail::make_device_uvector(source_rows_by_page[idx], stream, mr));
+      target_maps.push_back(
+        cudf::detail::make_device_uvector(target_rows_by_page[idx], stream, mr));
+    }
+
+    for (auto const& copy : page_copies) {
+      copy_sparse_fixed_width(copy.page_values,
+                              copy.output,
+                              source_maps[copy.row_map_idx].data(),
+                              target_maps[copy.row_map_idx].data(),
+                              static_cast<size_type>(source_maps[copy.row_map_idx].size()),
+                              copy.type_width,
+                              stream);
+    }
   }
 
   return output_columns;
