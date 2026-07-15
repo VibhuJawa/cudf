@@ -57,6 +57,25 @@ def test_read_lance_sparse_rows_and_columns(tmp_path):
     assert_eq(expect, got)
 
 
+def test_read_lance_sparse_zstd_many_pages(tmp_path):
+    rows_per_page = 12_288
+    rows = [page * rows_per_page + 7 for page in range(4)]
+    df = cudf.DataFrame(
+        {
+            "key": range(rows_per_page * 4),
+            "value": [row * 2 for row in range(rows_per_page * 4)],
+            "offset": [row % 17 for row in range(rows_per_page * 4)],
+        }
+    )
+
+    path = tmp_path / "sparse_zstd_many_pages.lance"
+    df.to_lance(path, compression="ZSTD", max_rows_per_page=rows_per_page)
+
+    got = cudf.read_lance(path, columns=["value", "key"], rows=rows)
+    expect = df[["value", "key"]].iloc[rows].reset_index(drop=True)
+    assert_eq(expect, got)
+
+
 def test_read_lance_all_rows(tmp_path):
     df = cudf.DataFrame(
         {
