@@ -2736,8 +2736,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
       }
       auto selected_chunk_count = std::size_t{0};
-      selected_miniblock_read_range_count += count_selected_miniblock_read_ranges(
-        selected_chunks, type_width <= sizeof(std::uint32_t));
+      if (type_width <= sizeof(std::uint32_t)) {
+        selected_miniblock_read_range_count +=
+          count_selected_miniblock_read_ranges(selected_chunks, true);
+      }
       for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
         if (selected_chunks[chunk_idx]) {
           auto const& chunk = chunks[chunk_idx];
@@ -2764,8 +2766,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
         }
         auto selected_chunk_count = std::size_t{0};
-        selected_miniblock_read_range_count += count_selected_miniblock_read_ranges(
-          selected_chunks, type_width <= sizeof(std::uint32_t));
+        if (type_width <= sizeof(std::uint32_t)) {
+          selected_miniblock_read_range_count +=
+            count_selected_miniblock_read_ranges(selected_chunks, true);
+        }
         for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
           if (selected_chunks[chunk_idx]) {
             auto const& chunk = chunks[chunk_idx];
