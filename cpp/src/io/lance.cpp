@@ -3779,6 +3779,7 @@ struct bulk_miniblock_plan {
   compression_type compression{};
   std::size_t value_offset{};
   std::size_t copy_idx{};
+  bool single_row_copy{};
   std::uint8_t const* header{};
   std::uint8_t* values{};
 };
@@ -3788,6 +3789,14 @@ struct bulk_sparse_copy_plan {
   std::uint8_t* output{};
   std::size_t row_map_offset{};
   size_type num_rows{};
+  std::size_t type_width{};
+};
+
+struct bulk_single_row_copy_plan {
+  std::uint8_t const* values{};
+  std::uint8_t* output{};
+  size_type source_row{};
+  size_type target_row{};
   std::size_t type_width{};
 };
 
@@ -4128,6 +4137,7 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
 
   std::vector<bulk_miniblock_plan> miniblock_plans;
   std::vector<bulk_sparse_copy_plan> copy_plans;
+  std::vector<bulk_single_row_copy_plan> single_row_copy_plans;
   std::vector<size_type> flat_source_rows;
   std::vector<size_type> flat_target_rows;
   std::size_t total_raw_size = 0;
@@ -4192,21 +4202,30 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
                        "Lance bulk sparse raw value buffer is too large");
           auto const value_offset = total_raw_size;
           total_raw_size += raw_size;
-          auto const row_map_offset = flat_source_rows.size();
           CUDF_EXPECTS(chunk_rows.size() <=
                          static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
                        "Lance sparse row group is too large");
-          for (auto const& [output_row, row_in_chunk] : chunk_rows) {
-            flat_target_rows.push_back(output_row);
-            flat_source_rows.push_back(row_in_chunk);
-          }
 
-          auto const copy_idx = copy_plans.size();
-          copy_plans.push_back(bulk_sparse_copy_plan{nullptr,
-                                                     output_data,
-                                                     row_map_offset,
-                                                     static_cast<size_type>(chunk_rows.size()),
-                                                     type_width});
+          auto copy_idx        = std::size_t{0};
+          auto single_row_copy = chunk_rows.size() == 1;
+          if (single_row_copy) {
+            auto const& [output_row, row_in_chunk] = chunk_rows.front();
+            copy_idx = single_row_copy_plans.size();
+            single_row_copy_plans.push_back(
+              bulk_single_row_copy_plan{nullptr, output_data, row_in_chunk, output_row, type_width});
+          } else {
+            auto const row_map_offset = flat_source_rows.size();
+            for (auto const& [output_row, row_in_chunk] : chunk_rows) {
+              flat_target_rows.push_back(output_row);
+              flat_source_rows.push_back(row_in_chunk);
+            }
+            copy_idx = copy_plans.size();
+            copy_plans.push_back(bulk_sparse_copy_plan{nullptr,
+                                                       output_data,
+                                                       row_map_offset,
+                                                       static_cast<size_type>(chunk_rows.size()),
+                                                       type_width});
+          }
           miniblock_plans.push_back(bulk_miniblock_plan{source_idx,
                                                         chunk.buffer_offset,
                                                         chunk.buffer_size,
@@ -4214,6 +4233,7 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
                                                         page.layout.compression,
                                                         value_offset,
                                                         copy_idx,
+                                                        single_row_copy,
                                                         nullptr,
                                                         nullptr});
 
@@ -4228,7 +4248,11 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
   rmm::device_uvector<std::uint8_t> sparse_values(total_raw_size, stream, mr);
   for (auto& plan : miniblock_plans) {
     plan.values = sparse_values.data() + plan.value_offset;
-    copy_plans[plan.copy_idx].values = plan.values;
+    if (plan.single_row_copy) {
+      single_row_copy_plans[plan.copy_idx].values = plan.values;
+    } else {
+      copy_plans[plan.copy_idx].values = plan.values;
+    }
   }
 
   std::vector<rmm::device_uvector<std::uint8_t>> input_buffers;
@@ -4269,6 +4293,18 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
                                       max_raw_size,
                                       total_decompress_raw_size,
                                       stream);
+  }
+
+  if (!single_row_copy_plans.empty()) {
+    std::vector<lance_sparse_copy_row> copy_rows;
+    copy_rows.reserve(single_row_copy_plans.size());
+    for (auto const& copy : single_row_copy_plans) {
+      copy_rows.push_back(lance_sparse_copy_row{
+        copy.values, copy.output, copy.source_row, copy.target_row, copy.type_width});
+    }
+    auto device_copy_rows = cudf::detail::make_device_uvector(copy_rows, stream, mr);
+    copy_sparse_fixed_width_single_row_batch(
+      device_copy_rows.data(), device_copy_rows.size(), stream);
   }
 
   if (!copy_plans.empty()) {
