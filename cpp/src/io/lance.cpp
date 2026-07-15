@@ -63,6 +63,15 @@ struct lance_miniblock_header {
   std::uint32_t payload_size{};
 };
 
+struct lance_sparse_copy_chunk {
+  std::uint8_t const* source{};
+  std::uint8_t* target{};
+  size_type const* source_rows{};
+  size_type const* target_rows{};
+  size_type num_rows{};
+  std::size_t type_width{};
+};
+
 void pack_lance_miniblocks(lance_pack_chunk const* chunks,
                            std::size_t num_chunks,
                            std::uint8_t* output,
@@ -73,6 +82,11 @@ void decode_lance_miniblock_headers(std::uint8_t const* const* headers,
                                     std::size_t num_headers,
                                     rmm::cuda_stream_view stream);
 
+void copy_sparse_fixed_width_batch(lance_sparse_copy_chunk const* chunks,
+                                   std::size_t num_chunks,
+                                   unsigned int blocks_per_chunk,
+                                   rmm::cuda_stream_view stream);
+
 namespace {
 
 constexpr std::size_t lance_buffer_alignment = 64;
@@ -81,6 +95,7 @@ constexpr std::uint32_t default_rows_per_page = 64 * 1024;
 constexpr std::uint32_t default_rows_per_miniblock = 4096;
 constexpr std::uint8_t default_rows_per_miniblock_log = 12;
 constexpr std::size_t sparse_header_batch_min_reads = 8;
+constexpr std::size_t sparse_copy_batch_min_chunks = 8;
 constexpr std::size_t miniblock_alignment = 8;
 constexpr std::array<std::uint8_t, 4> lance_magic{'L', 'A', 'N', 'C'};
 
@@ -2783,14 +2798,39 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         cudf::detail::make_device_uvector(target_rows_by_page[idx], stream, mr));
     }
 
-    for (auto const& copy : page_copies) {
-      copy_sparse_fixed_width(copy.page_values,
-                              copy.output,
-                              source_maps[copy.row_map_idx].data(),
-                              target_maps[copy.row_map_idx].data(),
-                              static_cast<size_type>(source_maps[copy.row_map_idx].size()),
-                              copy.type_width,
-                              stream);
+    if (page_copies.size() < sparse_copy_batch_min_chunks) {
+      for (auto const& copy : page_copies) {
+        copy_sparse_fixed_width(copy.page_values,
+                                copy.output,
+                                source_maps[copy.row_map_idx].data(),
+                                target_maps[copy.row_map_idx].data(),
+                                static_cast<size_type>(source_maps[copy.row_map_idx].size()),
+                                copy.type_width,
+                                stream);
+      }
+    } else {
+      constexpr size_type block_size = 256;
+      constexpr auto max_blocks_per_chunk = 65535u;
+      unsigned int blocks_per_chunk       = 1;
+      std::vector<lance_sparse_copy_chunk> copy_chunks;
+      copy_chunks.reserve(page_copies.size());
+      for (auto const& copy : page_copies) {
+        auto const num_rows = static_cast<size_type>(source_maps[copy.row_map_idx].size());
+        auto const chunk_blocks =
+          static_cast<unsigned int>(std::min<size_type>(
+            (num_rows + block_size - 1) / block_size, max_blocks_per_chunk));
+        blocks_per_chunk = std::max(blocks_per_chunk, chunk_blocks);
+        copy_chunks.push_back(lance_sparse_copy_chunk{copy.page_values,
+                                                      copy.output,
+                                                      source_maps[copy.row_map_idx].data(),
+                                                      target_maps[copy.row_map_idx].data(),
+                                                      num_rows,
+                                                      copy.type_width});
+      }
+
+      auto device_copy_chunks = cudf::detail::make_device_uvector(copy_chunks, stream, mr);
+      copy_sparse_fixed_width_batch(
+        device_copy_chunks.data(), device_copy_chunks.size(), blocks_per_chunk, stream);
     }
   }
 

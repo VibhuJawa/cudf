@@ -27,6 +27,15 @@ struct lance_miniblock_header {
   std::uint32_t payload_size{};
 };
 
+struct lance_sparse_copy_chunk {
+  std::uint8_t const* source{};
+  std::uint8_t* target{};
+  size_type const* source_rows{};
+  size_type const* target_rows{};
+  size_type num_rows{};
+  std::size_t type_width{};
+};
+
 namespace {
 
 __global__ void pack_lance_miniblocks_kernel(lance_pack_chunk const* chunks,
@@ -102,6 +111,36 @@ void launch_sparse_copy(std::uint8_t const* source,
     num_rows);
 }
 
+template <typename T>
+__device__ void sparse_copy_chunk(lance_sparse_copy_chunk const& chunk,
+                                  unsigned int blocks_per_chunk)
+{
+  auto const* source = reinterpret_cast<T const*>(chunk.source);
+  auto* target       = reinterpret_cast<T*>(chunk.target);
+  auto const tid =
+    static_cast<size_type>(blockIdx.y * blockDim.x + threadIdx.x);
+  auto const stride = static_cast<size_type>(blockDim.x * blocks_per_chunk);
+  for (size_type idx = tid; idx < chunk.num_rows; idx += stride) {
+    target[chunk.target_rows[idx]] = source[chunk.source_rows[idx]];
+  }
+}
+
+__global__ void sparse_copy_batch_kernel(lance_sparse_copy_chunk const* chunks,
+                                         std::size_t num_chunks,
+                                         unsigned int blocks_per_chunk)
+{
+  auto const chunk_idx = static_cast<std::size_t>(blockIdx.x);
+  if (chunk_idx >= num_chunks) { return; }
+
+  auto const chunk = chunks[chunk_idx];
+  switch (chunk.type_width) {
+    case sizeof(std::uint8_t): sparse_copy_chunk<std::uint8_t>(chunk, blocks_per_chunk); break;
+    case sizeof(std::uint16_t): sparse_copy_chunk<std::uint16_t>(chunk, blocks_per_chunk); break;
+    case sizeof(std::uint32_t): sparse_copy_chunk<std::uint32_t>(chunk, blocks_per_chunk); break;
+    case sizeof(std::uint64_t): sparse_copy_chunk<std::uint64_t>(chunk, blocks_per_chunk); break;
+  }
+}
+
 }  // namespace
 
 void pack_lance_miniblocks(lance_pack_chunk const* chunks,
@@ -169,6 +208,25 @@ void copy_sparse_fixed_width(std::uint8_t const* source,
     default: CUDF_FAIL("Unsupported Lance fixed-width sparse copy width");
   }
 
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
+void copy_sparse_fixed_width_batch(lance_sparse_copy_chunk const* chunks,
+                                   std::size_t num_chunks,
+                                   unsigned int blocks_per_chunk,
+                                   rmm::cuda_stream_view stream)
+{
+  if (num_chunks == 0) { return; }
+
+  constexpr int block_size = 256;
+  CUDF_EXPECTS(num_chunks <= static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+               "Too many Lance sparse copy chunks");
+  CUDF_EXPECTS(blocks_per_chunk > 0,
+               "Lance sparse copy batch must launch at least one block per chunk");
+
+  dim3 grid{static_cast<unsigned int>(num_chunks), blocks_per_chunk, 1};
+  sparse_copy_batch_kernel<<<grid, block_size, 0, stream.value()>>>(
+    chunks, num_chunks, blocks_per_chunk);
   CUDF_CUDA_TRY(cudaPeekAtLastError());
 }
 
