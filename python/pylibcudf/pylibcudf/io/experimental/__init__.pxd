@@ -5,3 +5,7 @@ from pylibcudf.io.experimental.hybrid_scan cimport (
     FileMetaData,
     HybridScanReader,
 )
+from pylibcudf.io.experimental.lance cimport (
+    LanceWriterOptions,
+    LanceWriterOptionsBuilder,
+)

@@ -7726,6 +7726,26 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
             index=index,
         )
 
+    def to_lance(
+        self,
+        path,
+        compression="ZSTD",
+        max_rows_per_page=None,
+        storage_options=None,
+        index=None,
+    ):
+        """Write a DataFrame to a Lance data file using libcudf."""
+        from cudf.io import lance
+
+        return lance.to_lance(
+            df=self,
+            path=path,
+            compression=compression,
+            max_rows_per_page=max_rows_per_page,
+            storage_options=storage_options,
+            index=index,
+        )
+
     @_performance_tracking
     def stack(
         self,

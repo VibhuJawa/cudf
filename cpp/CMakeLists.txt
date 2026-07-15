@@ -765,6 +765,7 @@ add_library(
   src/io/json/process_tokens.cu
   src/io/json/write_json.cpp
   src/io/json/write_json.cu
+  src/io/lance.cpp
   src/io/orc/aggregate_orc_metadata.cpp
   src/io/orc/dict_enc.cu
   src/io/orc/orc.cpp

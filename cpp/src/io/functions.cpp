@@ -22,6 +22,7 @@
 #include <cudf/io/detail/parquet.hpp>
 #include <cudf/io/detail/utils.hpp>
 #include <cudf/io/experimental/cudftable.hpp>
+#include <cudf/io/experimental/lance.hpp>
 #include <cudf/io/json.hpp>
 #include <cudf/io/orc.hpp>
 #include <cudf/io/orc_metadata.hpp>
@@ -1289,6 +1290,9 @@ void write_cudftable(data_sink* sink, table_view const& input, rmm::cuda_stream_
 packed_table read_cudftable(datasource* source,
                             rmm::cuda_stream_view stream,
                             rmm::device_async_resource_ref mr);
+void write_lance(data_sink* sink,
+                 lance_writer_options const& options,
+                 rmm::cuda_stream_view stream);
 }  // namespace detail
 
 /**
@@ -1317,6 +1321,19 @@ packed_table read_cudftable(cudftable_reader_options const& options,
   CUDF_EXPECTS(datasources.size() == 1, "CudfTable format only supports single source");
 
   return detail::read_cudftable(datasources[0].get(), stream, mr);
+}
+
+/**
+ * @copydoc cudf::io::experimental::write_lance
+ */
+void write_lance(lance_writer_options const& options, rmm::cuda_stream_view stream)
+{
+  CUDF_FUNC_RANGE();
+
+  auto sinks = make_datasinks(options.get_sink());
+  CUDF_EXPECTS(sinks.size() == 1, "Lance writer only supports single sink");
+
+  detail::write_lance(sinks[0].get(), options, stream);
 }
 
 }  // namespace experimental
