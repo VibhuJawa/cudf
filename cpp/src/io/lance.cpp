@@ -95,6 +95,7 @@ constexpr std::uint32_t default_rows_per_page = 64 * 1024;
 constexpr std::uint32_t default_rows_per_miniblock = 4096;
 constexpr std::uint8_t default_rows_per_miniblock_log = 12;
 constexpr std::size_t sparse_header_batch_min_reads = 8;
+constexpr std::size_t sparse_multi_column_header_batch_min_reads = 2;
 constexpr std::size_t sparse_copy_batch_min_chunks = 2;
 constexpr std::size_t miniblock_alignment = 8;
 constexpr std::array<std::uint8_t, 4> lance_magic{'L', 'A', 'N', 'C'};
@@ -2562,7 +2563,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   }
   auto const use_batched_sparse_headers =
     can_share_page_rows &&
-    shared_pages_touched * columns.size() >= sparse_header_batch_min_reads;
+    shared_pages_touched * columns.size() >= sparse_multi_column_header_batch_min_reads;
 
   for (auto column_idx : columns) {
     auto const& field       = file_info.fields[column_idx];
