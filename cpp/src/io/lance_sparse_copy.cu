@@ -36,6 +36,14 @@ struct lance_sparse_copy_chunk {
   std::size_t type_width{};
 };
 
+struct lance_sparse_copy_row {
+  std::uint8_t const* source{};
+  std::uint8_t* target{};
+  size_type source_row{};
+  size_type target_row{};
+  std::size_t type_width{};
+};
+
 namespace {
 
 __global__ void pack_lance_miniblocks_kernel(lance_pack_chunk const* chunks,
@@ -141,6 +149,29 @@ __global__ void sparse_copy_batch_kernel(lance_sparse_copy_chunk const* chunks,
   }
 }
 
+template <typename T>
+__device__ void sparse_copy_single_row(lance_sparse_copy_row const& row)
+{
+  auto const* source = reinterpret_cast<T const*>(row.source);
+  auto* target       = reinterpret_cast<T*>(row.target);
+  target[row.target_row] = source[row.source_row];
+}
+
+__global__ void sparse_copy_single_row_batch_kernel(lance_sparse_copy_row const* rows,
+                                                    std::size_t num_rows)
+{
+  auto const row_idx = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (row_idx >= num_rows) { return; }
+
+  auto const row = rows[row_idx];
+  switch (row.type_width) {
+    case sizeof(std::uint8_t): sparse_copy_single_row<std::uint8_t>(row); break;
+    case sizeof(std::uint16_t): sparse_copy_single_row<std::uint16_t>(row); break;
+    case sizeof(std::uint32_t): sparse_copy_single_row<std::uint32_t>(row); break;
+    case sizeof(std::uint64_t): sparse_copy_single_row<std::uint64_t>(row); break;
+  }
+}
+
 }  // namespace
 
 void pack_lance_miniblocks(lance_pack_chunk const* chunks,
@@ -227,6 +258,23 @@ void copy_sparse_fixed_width_batch(lance_sparse_copy_chunk const* chunks,
   dim3 grid{static_cast<unsigned int>(num_chunks), blocks_per_chunk, 1};
   sparse_copy_batch_kernel<<<grid, block_size, 0, stream.value()>>>(
     chunks, num_chunks, blocks_per_chunk);
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
+void copy_sparse_fixed_width_single_row_batch(lance_sparse_copy_row const* rows,
+                                              std::size_t num_rows,
+                                              rmm::cuda_stream_view stream)
+{
+  if (num_rows == 0) { return; }
+
+  constexpr int block_size = 256;
+  auto const grid_size     = (num_rows + block_size - 1) / block_size;
+  CUDF_EXPECTS(grid_size <= static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+               "Too many Lance sparse single-row copies");
+  sparse_copy_single_row_batch_kernel<<<static_cast<unsigned int>(grid_size),
+                                        block_size,
+                                        0,
+                                        stream.value()>>>(rows, num_rows);
   CUDF_CUDA_TRY(cudaPeekAtLastError());
 }
 

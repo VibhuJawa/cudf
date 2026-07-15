@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -72,6 +73,14 @@ struct lance_sparse_copy_chunk {
   std::size_t type_width{};
 };
 
+struct lance_sparse_copy_row {
+  std::uint8_t const* source{};
+  std::uint8_t* target{};
+  size_type source_row{};
+  size_type target_row{};
+  std::size_t type_width{};
+};
+
 void pack_lance_miniblocks(lance_pack_chunk const* chunks,
                            std::size_t num_chunks,
                            std::uint8_t* output,
@@ -87,6 +96,10 @@ void copy_sparse_fixed_width_batch(lance_sparse_copy_chunk const* chunks,
                                    unsigned int blocks_per_chunk,
                                    rmm::cuda_stream_view stream);
 
+void copy_sparse_fixed_width_single_row_batch(lance_sparse_copy_row const* rows,
+                                              std::size_t num_rows,
+                                              rmm::cuda_stream_view stream);
+
 namespace {
 
 constexpr std::size_t lance_buffer_alignment = 64;
@@ -98,6 +111,7 @@ constexpr std::size_t sparse_header_batch_min_reads = 8;
 constexpr std::size_t sparse_multi_column_header_batch_min_reads = 2;
 constexpr std::size_t sparse_copy_batch_min_chunks = 2;
 constexpr std::size_t sparse_max_coalesced_miniblock_reads = 4;
+constexpr std::size_t sparse_stack_miniblock_count = 64;
 constexpr std::size_t sparse_page_span_min_pages = 16;
 constexpr std::size_t sparse_page_span_min_chunks_per_page = 2;
 constexpr std::uint64_t sparse_page_span_max_bytes = std::uint64_t{64} << 20;
@@ -1113,6 +1127,47 @@ rmm::device_uvector<std::uint8_t> read_device_bytes(datasource* source,
   rmm::device_uvector<std::uint8_t> data(static_cast<std::size_t>(size), stream, mr);
   read_device_bytes_into(source, offset, size, data.data(), stream);
   return data;
+}
+
+struct pending_device_read {
+  std::uint64_t offset{};
+  std::uint64_t size{};
+  std::uint8_t* output{};
+};
+
+void read_device_byte_ranges_into(datasource* source,
+                                  std::vector<pending_device_read> const& reads,
+                                  rmm::cuda_stream_view stream)
+{
+  std::vector<std::future<std::size_t>> futures;
+  std::vector<std::size_t> expected_sizes;
+  futures.reserve(reads.size());
+  expected_sizes.reserve(reads.size());
+
+  for (auto const& read : reads) {
+    if (read.size == 0) { continue; }
+    CUDF_EXPECTS(read.size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
+                 "Lance device read range is too large");
+    CUDF_EXPECTS(read.offset <= source->size() && read.size <= source->size() - read.offset,
+                 "Lance device read range is out of bounds");
+    CUDF_EXPECTS(read.offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
+                 "Lance device read offset is too large");
+
+    auto const offset_bytes = static_cast<std::size_t>(read.offset);
+    auto const size_bytes   = static_cast<std::size_t>(read.size);
+    if (source->is_device_read_preferred(size_bytes)) {
+      futures.push_back(source->device_read_async(offset_bytes, size_bytes, read.output, stream));
+      expected_sizes.push_back(size_bytes);
+    } else {
+      read_device_bytes_into(source, read.offset, read.size, read.output, stream);
+    }
+  }
+
+  for (std::size_t idx = 0; idx < futures.size(); ++idx) {
+    auto const bytes_read = futures[idx].get();
+    CUDF_EXPECTS(bytes_read == expected_sizes[idx],
+                 "Failed to read expected Lance device bytes");
+  }
 }
 
 struct page_data_buffers {
@@ -2554,11 +2609,15 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   std::vector<std::vector<size_type>> source_rows_by_page;
   std::vector<std::vector<size_type>> target_rows_by_page;
   std::vector<sparse_page_copy> page_copies;
+  std::vector<lance_sparse_copy_row> single_row_page_copies;
+  std::vector<pending_device_read> pending_sparse_device_reads;
   page_value_buffers.reserve(total_pages);
   input_buffers.reserve(total_pages);
   source_rows_by_page.reserve(total_pages);
   target_rows_by_page.reserve(total_pages);
   page_copies.reserve(total_pages);
+  single_row_page_copies.reserve(total_pages);
+  pending_sparse_device_reads.reserve(total_pages);
 
   std::vector<device_span<std::uint8_t const>> inputs;
   std::vector<device_span<std::uint8_t>> outputs;
@@ -2573,7 +2632,6 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   if (can_share_page_rows) {
     auto const& pages = file_info.columns[columns.front()].pages;
     shared_rows_by_page.resize(pages.size());
-    shared_row_map_indices.resize(pages.size(), std::numeric_limits<std::size_t>::max());
     for (size_type output_row = 0; output_row < static_cast<size_type>(rows.size());
          ++output_row) {
       auto const page_idx = find_page_for_row(pages, rows[output_row]);
@@ -2585,6 +2643,16 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     for (std::size_t page_idx = 0; page_idx < shared_rows_by_page.size(); ++page_idx) {
       if (shared_rows_by_page[page_idx].empty()) { continue; }
       ++shared_pages_touched;
+    }
+  }
+  auto const use_batched_sparse_headers =
+    can_share_page_rows &&
+    shared_pages_touched * columns.size() >= sparse_multi_column_header_batch_min_reads;
+  if (can_share_page_rows && !use_batched_sparse_headers) {
+    shared_row_map_indices.resize(shared_rows_by_page.size(),
+                                  std::numeric_limits<std::size_t>::max());
+    for (std::size_t page_idx = 0; page_idx < shared_rows_by_page.size(); ++page_idx) {
+      if (shared_rows_by_page[page_idx].empty()) { continue; }
       std::vector<size_type> source_rows;
       std::vector<size_type> target_rows;
       source_rows.reserve(shared_rows_by_page[page_idx].size());
@@ -2598,9 +2666,6 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       target_rows_by_page.push_back(std::move(target_rows));
     }
   }
-  auto const use_batched_sparse_headers =
-    can_share_page_rows &&
-    shared_pages_touched * columns.size() >= sparse_multi_column_header_batch_min_reads;
 
   for (auto column_idx : columns) {
     auto const& field       = file_info.fields[column_idx];
@@ -2632,6 +2697,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     std::size_t selected_miniblock_count    = 0;
     std::size_t selected_raw_value_size     = 0;
     std::vector<std::vector<miniblock_chunk_info>> chunks_by_page(column_info.pages.size());
+    std::vector<std::size_t> selected_chunk_counts_by_page(column_info.pages.size(), 0);
     for (auto const& page : column_info.pages) {
       total_data_buffer_size += page.buffer_sizes[1];
     }
@@ -2647,6 +2713,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
         selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
       }
+      auto selected_chunk_count = std::size_t{0};
       for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
         if (selected_chunks[chunk_idx]) {
           auto const& chunk = chunks[chunk_idx];
@@ -2657,8 +2724,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           selected_data_buffer_size += chunks[chunk_idx].buffer_size;
           selected_raw_value_size += static_cast<std::size_t>(chunk.num_rows) * type_width;
           ++selected_miniblock_count;
+          ++selected_chunk_count;
         }
       }
+      selected_chunk_counts_by_page[page_idx] = selected_chunk_count;
     }
     if (shared_pages_touched <= 1) {
       for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
@@ -2670,6 +2739,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
           selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
         }
+        auto selected_chunk_count = std::size_t{0};
         for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
           if (selected_chunks[chunk_idx]) {
             auto const& chunk = chunks[chunk_idx];
@@ -2680,8 +2750,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
             selected_data_buffer_size += chunks[chunk_idx].buffer_size;
             selected_raw_value_size += static_cast<std::size_t>(chunk.num_rows) * type_width;
             ++selected_miniblock_count;
+            ++selected_chunk_count;
           }
         }
+        selected_chunk_counts_by_page[page_idx] = selected_chunk_count;
       }
     }
 
@@ -2712,6 +2784,17 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       continue;
     }
 
+    if (use_batched_sparse_headers && selected_miniblock_count > 0) {
+      sparse_miniblock_reads.reserve(sparse_miniblock_reads.size() + selected_miniblock_count);
+      inputs.reserve(inputs.size() + selected_miniblock_count);
+      outputs.reserve(outputs.size() + selected_miniblock_count);
+      output_sizes.reserve(output_sizes.size() + selected_miniblock_count);
+      page_copies.reserve(page_copies.size() + selected_miniblock_count);
+      source_rows_by_page.reserve(source_rows_by_page.size() + selected_miniblock_count);
+      target_rows_by_page.reserve(target_rows_by_page.size() + selected_miniblock_count);
+      single_row_page_copies.reserve(single_row_page_copies.size() + selected_miniblock_count);
+    }
+
     std::uint64_t sparse_page_span_begin = 0;
     std::uint8_t const* sparse_page_span_data = nullptr;
     if (use_batched_sparse_headers &&
@@ -2733,7 +2816,9 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       }
       auto const span_size = span_end - span_begin;
       if (span_size <= sparse_page_span_max_bytes) {
-        input_buffers.push_back(read_device_bytes(source, span_begin, span_size, stream, mr));
+        input_buffers.emplace_back(static_cast<std::size_t>(span_size), stream, mr);
+        pending_sparse_device_reads.push_back(
+          pending_device_read{span_begin, span_size, input_buffers.back().data()});
         sparse_page_span_begin = span_begin;
         sparse_page_span_data  = input_buffers.back().data();
       }
@@ -2764,13 +2849,54 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
                        type_width,
                    "Lance page is too large to read");
       auto const& chunks = chunks_by_page[page_idx];
-      std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_chunk(chunks.size());
-      for (auto const& [output_row, row_in_page] : rows_by_page[page_idx]) {
-        auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
-        auto const& chunk    = chunks[chunk_idx];
-        auto const row_in_chunk =
-          static_cast<size_type>(static_cast<std::uint64_t>(row_in_page) - chunk.row_begin);
-        rows_by_chunk[chunk_idx].emplace_back(output_row, row_in_chunk);
+      auto const& page_rows_for_copy = rows_by_page[page_idx];
+      auto has_distinct_chunk_rows = use_batched_sparse_headers &&
+                                     selected_chunk_counts_by_page[page_idx] ==
+                                       page_rows_for_copy.size();
+      std::array<std::uint8_t, sparse_stack_miniblock_count> stack_chunk_row_counts{};
+      std::array<std::pair<size_type, size_type>, sparse_stack_miniblock_count>
+        stack_single_rows_by_chunk{};
+      std::vector<std::uint8_t> heap_chunk_row_counts;
+      std::vector<std::pair<size_type, size_type>> heap_single_rows_by_chunk;
+      auto chunk_row_counts = [&](std::size_t chunk_idx) -> std::uint8_t& {
+        return chunks.size() <= sparse_stack_miniblock_count ? stack_chunk_row_counts[chunk_idx]
+                                                             : heap_chunk_row_counts[chunk_idx];
+      };
+      auto single_rows_by_chunk =
+        [&](std::size_t chunk_idx) -> std::pair<size_type, size_type>& {
+        return chunks.size() <= sparse_stack_miniblock_count
+                 ? stack_single_rows_by_chunk[chunk_idx]
+                 : heap_single_rows_by_chunk[chunk_idx];
+      };
+      if (has_distinct_chunk_rows) {
+        if (chunks.size() > sparse_stack_miniblock_count) {
+          heap_chunk_row_counts.assign(chunks.size(), 0);
+          heap_single_rows_by_chunk.resize(chunks.size());
+        }
+        for (auto const& [output_row, row_in_page] : page_rows_for_copy) {
+          auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
+          if (chunk_row_counts(chunk_idx) != 0) {
+            has_distinct_chunk_rows = false;
+            break;
+          }
+          auto const& chunk = chunks[chunk_idx];
+          auto const row_in_chunk =
+            static_cast<size_type>(static_cast<std::uint64_t>(row_in_page) - chunk.row_begin);
+          chunk_row_counts(chunk_idx) = 1;
+          single_rows_by_chunk(chunk_idx) = std::pair{output_row, row_in_chunk};
+        }
+      }
+
+      std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_chunk;
+      if (!has_distinct_chunk_rows) {
+        rows_by_chunk.resize(chunks.size());
+        for (auto const& [output_row, row_in_page] : page_rows_for_copy) {
+          auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
+          auto const& chunk    = chunks[chunk_idx];
+          auto const row_in_chunk =
+            static_cast<size_type>(static_cast<std::uint64_t>(row_in_page) - chunk.row_begin);
+          rows_by_chunk[chunk_idx].emplace_back(output_row, row_in_chunk);
+        }
       }
 
       std::vector<selected_miniblock_payload> selected;
@@ -2781,7 +2907,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       std::size_t total_payload_size     = 0;
       std::size_t total_miniblock_size   = 0;
       for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
-        if (rows_by_chunk[chunk_idx].empty()) { continue; }
+        auto const chunk_selected =
+          has_distinct_chunk_rows ? chunk_row_counts(chunk_idx) != 0
+                                  : !rows_by_chunk[chunk_idx].empty();
+        if (!chunk_selected) { continue; }
         auto const& chunk = chunks[chunk_idx];
         CUDF_EXPECTS(chunk.num_rows <=
                        static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) /
@@ -2847,8 +2976,17 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           }
         }
       } else if (read_full_page) {
-        input_buffers.push_back(
-          read_device_bytes(source, page.buffer_offsets[1], page.buffer_sizes[1], stream, mr));
+        input_buffers.emplace_back(static_cast<std::size_t>(page.buffer_sizes[1]), stream, mr);
+        if (!use_batched_sparse_headers && page.layout.compression == compression_type::NONE) {
+          read_device_bytes_into(source,
+                                 page.buffer_offsets[1],
+                                 page.buffer_sizes[1],
+                                 input_buffers.back().data(),
+                                 stream);
+        } else {
+          pending_sparse_device_reads.push_back(pending_device_read{
+            page.buffer_offsets[1], page.buffer_sizes[1], input_buffers.back().data()});
+        }
         if (use_batched_sparse_headers) {
           for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
             auto const& chunk = selected_chunks[idx].chunk;
@@ -2896,22 +3034,20 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
                 ++range_chunks;
                 ++idx;
               }
-              read_device_bytes_into(source,
-                                     range_offset,
-                                     range_size,
-                                     input_buffers.back().data() + input_offsets[range_begin_idx],
-                                     stream);
+              pending_sparse_device_reads.push_back(pending_device_read{
+                range_offset,
+                range_size,
+                input_buffers.back().data() + input_offsets[range_begin_idx]});
               input_offset += static_cast<std::size_t>(range_size);
             }
           } else {
             for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
               auto const& chunk = selected_chunks[idx].chunk;
               input_offsets[idx] = input_offset;
-              read_device_bytes_into(source,
-                                     chunk.buffer_offset,
-                                     chunk.buffer_size,
-                                     input_buffers.back().data() + input_offset,
-                                     stream);
+              pending_sparse_device_reads.push_back(pending_device_read{
+                chunk.buffer_offset,
+                chunk.buffer_size,
+                input_buffers.back().data() + input_offset});
               input_offset += static_cast<std::size_t>(chunk.buffer_size);
             }
           }
@@ -2919,11 +3055,18 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           for (std::size_t idx = 0; idx < selected.size(); ++idx) {
             auto const& payload = selected[idx].payload;
             input_offsets[idx]  = input_offset;
-            read_device_bytes_into(source,
-                                   payload.payload_offset,
-                                   payload.payload_size,
-                                   input_buffers.back().data() + input_offset,
-                                   stream);
+            if (page.layout.compression == compression_type::NONE) {
+              read_device_bytes_into(source,
+                                     payload.payload_offset,
+                                     payload.payload_size,
+                                     input_buffers.back().data() + input_offset,
+                                     stream);
+            } else {
+              pending_sparse_device_reads.push_back(
+                pending_device_read{payload.payload_offset,
+                                    payload.payload_size,
+                                    input_buffers.back().data() + input_offset});
+            }
             input_offset += payload.payload_size;
           }
         }
@@ -2949,19 +3092,27 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
                                   selected_chunk.chunk.buffer_size,
                                   page.layout.compression});
 
-          std::vector<size_type> source_rows;
-          std::vector<size_type> target_rows;
-          source_rows.reserve(rows_by_chunk[selected_chunk.chunk_idx].size());
-          target_rows.reserve(rows_by_chunk[selected_chunk.chunk_idx].size());
-          for (auto const& [output_row, row_in_chunk] : rows_by_chunk[selected_chunk.chunk_idx]) {
-            target_rows.push_back(output_row);
-            source_rows.push_back(row_in_chunk);
+          if (has_distinct_chunk_rows) {
+            auto const& [output_row, row_in_chunk] =
+              single_rows_by_chunk(selected_chunk.chunk_idx);
+            single_row_page_copies.push_back(lance_sparse_copy_row{
+              chunk_values, output_data, row_in_chunk, output_row, type_width});
+          } else {
+            auto const& chunk_rows = rows_by_chunk[selected_chunk.chunk_idx];
+            std::vector<size_type> source_rows;
+            std::vector<size_type> target_rows;
+            source_rows.reserve(chunk_rows.size());
+            target_rows.reserve(chunk_rows.size());
+            for (auto const& [output_row, row_in_chunk] : chunk_rows) {
+              target_rows.push_back(output_row);
+              source_rows.push_back(row_in_chunk);
+            }
+            auto const row_map_idx = source_rows_by_page.size();
+            source_rows_by_page.push_back(std::move(source_rows));
+            target_rows_by_page.push_back(std::move(target_rows));
+            page_copies.push_back(
+              sparse_page_copy{chunk_values, output_data, row_map_idx, type_width});
           }
-          auto const row_map_idx = source_rows_by_page.size();
-          source_rows_by_page.push_back(std::move(source_rows));
-          target_rows_by_page.push_back(std::move(target_rows));
-          page_copies.push_back(
-            sparse_page_copy{chunk_values, output_data, row_map_idx, type_width});
         }
         continue;
       } else if (page.layout.compression == compression_type::NONE) {
@@ -3014,6 +3165,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     }
   }
 
+  read_device_byte_ranges_into(source, pending_sparse_device_reads, stream);
+
   append_sparse_miniblock_reads(sparse_miniblock_reads,
                                 inputs,
                                 outputs,
@@ -3026,6 +3179,13 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   if (!inputs.empty()) {
     decompress_zstd_device_batch_into(
       inputs, outputs, output_sizes, max_raw_size, total_raw_size, stream);
+  }
+
+  if (!single_row_page_copies.empty()) {
+    auto device_single_row_page_copies =
+      cudf::detail::make_device_uvector(single_row_page_copies, stream, mr);
+    copy_sparse_fixed_width_single_row_batch(
+      device_single_row_page_copies.data(), device_single_row_page_copies.size(), stream);
   }
 
   if (!page_copies.empty()) {

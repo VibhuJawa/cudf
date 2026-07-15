@@ -236,6 +236,42 @@ TEST_F(LanceWriterTest, ReadsSparseRowsAcrossMiniBlockChunks)
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected_table, result.tbl->view());
 }
 
+TEST_F(LanceWriterTest, ReadsZstdSparseRowsAcrossMiniBlockChunksFromMultipleColumns)
+{
+  std::vector<int32_t> lhs(20000);
+  std::vector<int32_t> rhs(20000);
+  std::iota(lhs.begin(), lhs.end(), 0);
+  std::transform(lhs.begin(), lhs.end(), rhs.begin(), [](auto value) { return value * 3 + 7; });
+  cudf::test::fixed_width_column_wrapper<int32_t> lhs_col(lhs.begin(), lhs.end());
+  cudf::test::fixed_width_column_wrapper<int32_t> rhs_col(rhs.begin(), rhs.end());
+  cudf::table_view table({lhs_col, rhs_col});
+
+  cudf::io::table_metadata metadata;
+  metadata.schema_info.push_back(cudf::io::column_name_info{"lhs", {}});
+  metadata.schema_info.push_back(cudf::io::column_name_info{"rhs", {}});
+
+  std::vector<char> buffer;
+  auto write_options = cudf::io::experimental::lance_writer_options::builder(
+                         cudf::io::sink_info{&buffer}, table)
+                         .metadata(std::move(metadata))
+                         .max_rows_per_page(20000)
+                         .build();
+  cudf::io::experimental::write_lance(write_options);
+
+  auto read_options = cudf::io::experimental::lance_reader_options::builder(
+                        cudf::io::source_info{cudf::host_span<char>{buffer.data(), buffer.size()}})
+                        .columns({"rhs", "lhs"})
+                        .rows({7, 8192 + 13})
+                        .build();
+  auto result = cudf::io::experimental::read_lance(read_options);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> expected_rhs(
+    {rhs[7], rhs[8192 + 13]});
+  cudf::test::fixed_width_column_wrapper<int32_t> expected_lhs({lhs[7], lhs[8192 + 13]});
+  cudf::table_view expected({expected_rhs, expected_lhs});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
+}
+
 TEST_F(LanceWriterTest, RejectsUnsupportedCompression)
 {
   cudf::test::fixed_width_column_wrapper<int32_t> col({1, 2, 3});
