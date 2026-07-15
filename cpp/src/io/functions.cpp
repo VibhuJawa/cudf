@@ -1297,6 +1297,10 @@ table_with_metadata read_lance(datasource* source,
                                lance_reader_options const& options,
                                rmm::cuda_stream_view stream,
                                rmm::device_async_resource_ref mr);
+lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> const& sources,
+                                       lance_bulk_reader_options const& options,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr);
 }  // namespace detail
 
 /**
@@ -1353,6 +1357,21 @@ table_with_metadata read_lance(lance_reader_options const& options,
   CUDF_EXPECTS(datasources.size() == 1, "Lance reader only supports single source");
 
   return detail::read_lance(datasources[0].get(), options, stream, mr);
+}
+
+/**
+ * @copydoc cudf::io::experimental::read_lance_bulk
+ */
+lance_bulk_read_result read_lance_bulk(lance_bulk_reader_options const& options,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+
+  auto datasources = make_datasources(options.get_source());
+  CUDF_EXPECTS(!datasources.empty(), "Lance bulk reader requires at least one source");
+
+  return detail::read_lance_bulk(datasources, options, stream, mr);
 }
 
 }  // namespace experimental

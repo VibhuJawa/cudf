@@ -272,6 +272,86 @@ TEST_F(LanceWriterTest, ReadsZstdSparseRowsAcrossMiniBlockChunksFromMultipleColu
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
 }
 
+TEST_F(LanceWriterTest, BulkReadsSparseRowsAcrossMultipleSources)
+{
+  constexpr int32_t num_rows = 5000;
+  std::vector<std::vector<cudf::size_type>> rows_per_source{
+    {0, 1024, 4096}, {3, 2048}, {4999, 1, 4999}};
+  std::vector<std::vector<char>> buffers(3);
+
+  for (std::size_t source_idx = 0; source_idx < buffers.size(); ++source_idx) {
+    std::vector<int32_t> lhs(num_rows);
+    std::vector<int32_t> rhs(num_rows);
+    auto const base = static_cast<int32_t>(source_idx * 100000);
+    std::iota(lhs.begin(), lhs.end(), base);
+    std::transform(lhs.begin(), lhs.end(), rhs.begin(), [](auto value) { return value * 2 + 7; });
+
+    cudf::test::fixed_width_column_wrapper<int32_t> lhs_col(lhs.begin(), lhs.end());
+    cudf::test::fixed_width_column_wrapper<int32_t> rhs_col(rhs.begin(), rhs.end());
+    cudf::table_view table({lhs_col, rhs_col});
+
+    cudf::io::table_metadata metadata;
+    metadata.schema_info.push_back(cudf::io::column_name_info{"lhs", {}});
+    metadata.schema_info.push_back(cudf::io::column_name_info{"rhs", {}});
+
+    auto write_options = cudf::io::experimental::lance_writer_options::builder(
+                           cudf::io::sink_info{&buffers[source_idx]}, table)
+                           .metadata(std::move(metadata))
+                           .max_rows_per_page(num_rows)
+                           .build();
+    cudf::io::experimental::write_lance(write_options);
+  }
+
+  std::vector<cudf::host_span<char>> buffer_spans;
+  buffer_spans.reserve(buffers.size());
+  for (auto& buffer : buffers) {
+    buffer_spans.push_back(cudf::host_span<char>{buffer.data(), buffer.size()});
+  }
+
+  auto read_options =
+    cudf::io::experimental::lance_bulk_reader_options::builder(cudf::io::source_info{
+      cudf::host_span<cudf::host_span<char>>{buffer_spans.data(), buffer_spans.size()}})
+      .columns({"rhs", "lhs"})
+      .rows(rows_per_source)
+      .read_coalesce_gap_bytes(0)
+      .build();
+  auto result = cudf::io::experimental::read_lance_bulk(read_options);
+
+  std::vector<int32_t> expected_lhs;
+  std::vector<int32_t> expected_rhs;
+  for (std::size_t source_idx = 0; source_idx < rows_per_source.size(); ++source_idx) {
+    auto const base = static_cast<int32_t>(source_idx * 100000);
+    for (auto row : rows_per_source[source_idx]) {
+      auto const lhs = base + row;
+      expected_lhs.push_back(lhs);
+      expected_rhs.push_back(lhs * 2 + 7);
+    }
+  }
+  cudf::test::fixed_width_column_wrapper<int32_t> expected_rhs_col(expected_rhs.begin(),
+                                                                   expected_rhs.end());
+  cudf::test::fixed_width_column_wrapper<int32_t> expected_lhs_col(expected_lhs.begin(),
+                                                                   expected_lhs.end());
+  cudf::table_view expected({expected_rhs_col, expected_lhs_col});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.data.tbl->view());
+
+  ASSERT_EQ(result.data.metadata.num_rows_per_source.size(), rows_per_source.size());
+  EXPECT_EQ(result.data.metadata.num_rows_per_source[0], rows_per_source[0].size());
+  EXPECT_EQ(result.data.metadata.num_rows_per_source[1], rows_per_source[1].size());
+  EXPECT_EQ(result.data.metadata.num_rows_per_source[2], rows_per_source[2].size());
+  EXPECT_EQ(result.metrics.rows_requested, expected_lhs.size());
+  EXPECT_EQ(result.metrics.requested_output_bytes,
+            expected_lhs.size() * 2 * sizeof(int32_t));
+  EXPECT_EQ(result.metrics.files_touched, 3);
+  EXPECT_EQ(result.metrics.columns_touched, 6);
+  EXPECT_GT(result.metrics.touched_miniblocks, 0);
+  EXPECT_GT(result.metrics.compressed_miniblock_bytes_touched, 0);
+  EXPECT_GT(result.metrics.uncompressed_miniblock_bytes_decompressed, 0);
+  EXPECT_GE(result.metrics.coalesced_file_bytes_read,
+            result.metrics.compressed_miniblock_bytes_touched);
+  EXPECT_GE(result.metrics.file_ranges_before_coalescing,
+            result.metrics.file_ranges_after_coalescing);
+}
+
 TEST_F(LanceWriterTest, RejectsUnsupportedCompression)
 {
   cudf::test::fixed_width_column_wrapper<int32_t> col({1, 2, 3});

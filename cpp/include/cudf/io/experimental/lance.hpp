@@ -15,6 +15,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -369,6 +370,201 @@ class lance_reader_options_builder {
  */
 table_with_metadata read_lance(
   lance_reader_options const& options,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+class lance_bulk_reader_options_builder;
+
+/**
+ * @brief Cold sparse-read amplification metrics collected by `read_lance_bulk()`.
+ */
+struct lance_read_metrics {
+  /// Bytes requested in the final output
+  std::uint64_t requested_output_bytes{};
+  /// Encoded MiniBlock bytes read
+  std::uint64_t compressed_miniblock_bytes_touched{};
+  /// Decoded MiniBlock value bytes
+  std::uint64_t uncompressed_miniblock_bytes_decompressed{};
+  /// Physical bytes read after coalescing
+  std::uint64_t coalesced_file_bytes_read{};
+  /// MiniBlock ranges before scheduling
+  std::uint64_t file_ranges_before_coalescing{};
+  /// Physical file ranges issued
+  std::uint64_t file_ranges_after_coalescing{};
+  /// Output rows requested
+  std::uint64_t rows_requested{};
+  /// MiniBlocks selected by the request
+  std::uint64_t touched_miniblocks{};
+  /// Columns read across all sources
+  std::uint64_t columns_touched{};
+  /// Sources with at least one row
+  std::uint64_t files_touched{};
+};
+
+/**
+ * @brief Result returned by `read_lance_bulk()`.
+ */
+struct lance_bulk_read_result {
+  table_with_metadata data;   ///< Output table and metadata
+  lance_read_metrics metrics; ///< Cold sparse-read diagnostics
+};
+
+/**
+ * @brief Settings for `read_lance_bulk()`.
+ *
+ * This API reads sparse row selections from many Lance sources in one scheduling scope. Rows are
+ * emitted in input-source order, and within each source they preserve the order supplied in that
+ * source's row-selection vector.
+ */
+class lance_bulk_reader_options {
+  source_info _source;
+  std::vector<std::string> _columns;
+  std::vector<std::vector<size_type>> _rows_per_source;
+  std::uint64_t _read_coalesce_gap_bytes = 64 * 1024;
+  bool _has_row_selection = false;
+
+  friend lance_bulk_reader_options_builder;
+
+  /**
+   * @brief Constructor from source info.
+   *
+   * @param source Source information used to read Lance files
+   */
+  explicit lance_bulk_reader_options(source_info source) : _source(std::move(source)) {}
+
+ public:
+  /**
+   * @brief Default constructor for interoperability.
+   */
+  lance_bulk_reader_options() = default;
+
+  /**
+   * @brief Creates a builder to build `lance_bulk_reader_options`.
+   *
+   * @param source Source information used to read Lance files
+   * @return Builder to build bulk reader options
+   */
+  static lance_bulk_reader_options_builder builder(source_info source = source_info{});
+
+  /**
+   * @brief Returns source info.
+   *
+   * @return Source info
+   */
+  [[nodiscard]] source_info const& get_source() const noexcept { return _source; }
+
+  /**
+   * @brief Returns selected column names.
+   *
+   * Empty means all columns are selected.
+   *
+   * @return Selected column names
+   */
+  [[nodiscard]] std::vector<std::string> const& get_columns() const noexcept { return _columns; }
+
+  /**
+   * @brief Returns selected row indices per source.
+   *
+   * @return Row selections, one vector per input source
+   */
+  [[nodiscard]] std::vector<std::vector<size_type>> const& get_rows_per_source() const noexcept
+  {
+    return _rows_per_source;
+  }
+
+  /**
+   * @brief Returns maximum byte gap to coalesce between selected MiniBlock file ranges.
+   *
+   * @return Maximum coalescing gap in bytes
+   */
+  [[nodiscard]] std::uint64_t get_read_coalesce_gap_bytes() const noexcept
+  {
+    return _read_coalesce_gap_bytes;
+  }
+
+  /**
+   * @brief Returns whether sparse row selection is enabled.
+   *
+   * @return true if rows were supplied
+   */
+  [[nodiscard]] bool has_row_selection() const noexcept { return _has_row_selection; }
+};
+
+/**
+ * @brief Class to build `lance_bulk_reader_options`.
+ */
+class lance_bulk_reader_options_builder {
+ public:
+  /**
+   * @brief Default constructor for interoperability.
+   */
+  lance_bulk_reader_options_builder() = default;
+
+  /**
+   * @brief Constructor from source info.
+   *
+   * @param source Source information used to read Lance files
+   */
+  explicit lance_bulk_reader_options_builder(source_info source) : _options(std::move(source)) {}
+
+  /**
+   * @brief Select columns by name.
+   *
+   * @param columns Column names to read. Empty means all columns.
+   * @return this for chaining
+   */
+  lance_bulk_reader_options_builder& columns(std::vector<std::string> columns)
+  {
+    _options._columns = std::move(columns);
+    return *this;
+  }
+
+  /**
+   * @brief Select top-level row indices to read from each source.
+   *
+   * @param rows_per_source Row indices per source
+   * @return this for chaining
+   */
+  lance_bulk_reader_options_builder& rows(std::vector<std::vector<size_type>> rows_per_source)
+  {
+    _options._rows_per_source   = std::move(rows_per_source);
+    _options._has_row_selection = true;
+    return *this;
+  }
+
+  /**
+   * @brief Set maximum byte gap to coalesce between selected MiniBlock file ranges.
+   *
+   * @param bytes Maximum gap in bytes
+   * @return this for chaining
+   */
+  lance_bulk_reader_options_builder& read_coalesce_gap_bytes(std::uint64_t bytes) noexcept
+  {
+    _options._read_coalesce_gap_bytes = bytes;
+    return *this;
+  }
+
+  /**
+   * @brief Build `lance_bulk_reader_options`.
+   *
+   * @return The constructed `lance_bulk_reader_options` object
+   */
+  [[nodiscard]] lance_bulk_reader_options build() const { return _options; }
+
+ private:
+  lance_bulk_reader_options _options;
+};
+
+/**
+ * @brief Read sparse rows from multiple self-described Lance data files into a cuDF table.
+ *
+ * @param options Options specifying sources, selected columns, and rows per source
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate output columns
+ * @return Table, metadata, and cold sparse-read diagnostics
+ */
+lance_bulk_read_result read_lance_bulk(
+  lance_bulk_reader_options const& options,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
