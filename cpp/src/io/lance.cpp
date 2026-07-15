@@ -2630,6 +2630,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     std::uint64_t total_data_buffer_size    = 0;
     std::uint64_t selected_data_buffer_size = 0;
     std::size_t selected_miniblock_count    = 0;
+    std::size_t selected_raw_value_size     = 0;
     std::vector<std::vector<miniblock_chunk_info>> chunks_by_page(column_info.pages.size());
     for (auto const& page : column_info.pages) {
       total_data_buffer_size += page.buffer_sizes[1];
@@ -2648,7 +2649,13 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       }
       for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
         if (selected_chunks[chunk_idx]) {
+          auto const& chunk = chunks[chunk_idx];
+          CUDF_EXPECTS(chunk.num_rows <=
+                         static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) /
+                           type_width,
+                       "Lance MiniBlock is too large to read");
           selected_data_buffer_size += chunks[chunk_idx].buffer_size;
+          selected_raw_value_size += static_cast<std::size_t>(chunk.num_rows) * type_width;
           ++selected_miniblock_count;
         }
       }
@@ -2665,7 +2672,13 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         }
         for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
           if (selected_chunks[chunk_idx]) {
+            auto const& chunk = chunks[chunk_idx];
+            CUDF_EXPECTS(chunk.num_rows <=
+                           static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) /
+                             type_width,
+                         "Lance MiniBlock is too large to read");
             selected_data_buffer_size += chunks[chunk_idx].buffer_size;
+            selected_raw_value_size += static_cast<std::size_t>(chunk.num_rows) * type_width;
             ++selected_miniblock_count;
           }
         }
@@ -2733,6 +2746,13 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
                                                 mr);
     auto* output_data = output->mutable_view().head<std::uint8_t>();
     output_columns.push_back(std::move(output));
+
+    std::uint8_t* sparse_value_data = nullptr;
+    if (use_batched_sparse_headers && selected_raw_value_size > 0) {
+      page_value_buffers.emplace_back(selected_raw_value_size, stream, mr);
+      sparse_value_data = page_value_buffers.back().data();
+    }
+    std::size_t sparse_value_offset = 0;
 
     for (auto page_idx : touched_page_indices) {
       auto const& page = column_info.pages[page_idx];
@@ -2917,8 +2937,11 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       if (use_batched_sparse_headers) {
         for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
           auto const& selected_chunk = selected_chunks[idx];
-          page_value_buffers.emplace_back(selected_chunk.raw_size, stream, mr);
-          auto* chunk_values = page_value_buffers.back().data();
+          CUDF_EXPECTS(sparse_value_data != nullptr &&
+                         selected_chunk.raw_size <= selected_raw_value_size - sparse_value_offset,
+                       "Invalid Lance sparse value buffer offset");
+          auto* chunk_values = sparse_value_data + sparse_value_offset;
+          sparse_value_offset += selected_chunk.raw_size;
           sparse_miniblock_reads.push_back(
             sparse_miniblock_read{input_data + input_offsets[idx],
                                   chunk_values,
@@ -2984,6 +3007,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         target_rows_by_page.push_back(std::move(target_rows));
       }
       page_copies.push_back(sparse_page_copy{page_values, output_data, row_map_idx, type_width});
+    }
+    if (use_batched_sparse_headers) {
+      CUDF_EXPECTS(sparse_value_offset == selected_raw_value_size,
+                   "Lance sparse value buffer was not fully assigned");
     }
   }
 
