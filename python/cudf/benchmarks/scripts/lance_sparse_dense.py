@@ -89,7 +89,11 @@ def package_version(name: str) -> str | None:
 
 
 def rapids_package_version(name: str) -> str | None:
-    return package_version(name) or package_version(f"{name}-cu12")
+    return (
+        package_version(name)
+        or package_version(f"{name}-cu13")
+        or package_version(f"{name}-cu12")
+    )
 
 
 def storage_options_from_datamover(path: Path, location: str) -> dict[str, str]:
