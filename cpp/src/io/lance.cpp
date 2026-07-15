@@ -1277,6 +1277,40 @@ std::vector<std::vector<miniblock_chunk_info>> read_miniblock_chunks(
   return result;
 }
 
+std::vector<std::size_t> read_touched_miniblock_chunks(
+  datasource* source,
+  std::vector<lance_page_info> const& pages,
+  std::vector<std::vector<std::pair<size_type, size_type>>> const& rows_by_page,
+  std::vector<std::vector<miniblock_chunk_info>>& chunks_by_page)
+{
+  std::vector<std::size_t> touched_page_indices;
+
+  for (std::size_t page_idx = 0; page_idx < rows_by_page.size(); ++page_idx) {
+    if (rows_by_page[page_idx].empty()) { continue; }
+    touched_page_indices.push_back(page_idx);
+  }
+
+  if (touched_page_indices.empty()) { return touched_page_indices; }
+
+  if (touched_page_indices.size() == 1) {
+    auto const page_idx   = touched_page_indices.front();
+    chunks_by_page[page_idx] = read_miniblock_chunks(source, pages[page_idx]);
+    return touched_page_indices;
+  }
+
+  std::vector<lance_page_info> touched_pages;
+  touched_pages.reserve(touched_page_indices.size());
+  for (auto page_idx : touched_page_indices) {
+    touched_pages.push_back(pages[page_idx]);
+  }
+
+  auto touched_chunks = read_miniblock_chunks(source, touched_pages);
+  for (std::size_t idx = 0; idx < touched_page_indices.size(); ++idx) {
+    chunks_by_page[touched_page_indices[idx]] = std::move(touched_chunks[idx]);
+  }
+  return touched_page_indices;
+}
+
 struct pending_miniblock_chunk {
   std::uint64_t num_rows{};
   std::uint8_t log_num_values{};
@@ -2292,10 +2326,10 @@ std::unique_ptr<column> read_lance_column(datasource* source,
   for (auto const& page : column_info.pages) {
     total_data_buffer_size += page.buffer_sizes[1];
   }
-  for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
-    if (rows_by_page[page_idx].empty()) { continue; }
+  auto const touched_page_indices =
+    read_touched_miniblock_chunks(source, column_info.pages, rows_by_page, chunks_by_page);
+  for (auto page_idx : touched_page_indices) {
 
-    chunks_by_page[page_idx] = read_miniblock_chunks(source, column_info.pages[page_idx]);
     auto const& chunks       = chunks_by_page[page_idx];
     std::vector<bool> selected_chunks(chunks.size(), false);
     for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
@@ -2344,8 +2378,7 @@ std::unique_ptr<column> read_lance_column(datasource* source,
   std::size_t total_raw_size = 0;
   std::size_t max_raw_size   = 0;
 
-  for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
-    if (rows_by_page[page_idx].empty()) { continue; }
+  for (auto page_idx : touched_page_indices) {
     auto const& page = column_info.pages[page_idx];
     CUDF_EXPECTS(page.length <= static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
                  "Lance page contains too many rows for cuDF");
@@ -2596,10 +2629,13 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     for (auto const& page : column_info.pages) {
       total_data_buffer_size += page.buffer_sizes[1];
     }
-    for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
-      if (rows_by_page[page_idx].empty()) { continue; }
+    std::vector<std::size_t> touched_page_indices;
+    if (shared_pages_touched > 1) {
+      touched_page_indices =
+        read_touched_miniblock_chunks(source, column_info.pages, rows_by_page, chunks_by_page);
+    }
+    for (auto page_idx : touched_page_indices) {
 
-      chunks_by_page[page_idx] = read_miniblock_chunks(source, column_info.pages[page_idx]);
       auto const& chunks       = chunks_by_page[page_idx];
       std::vector<bool> selected_chunks(chunks.size(), false);
       for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
@@ -2608,6 +2644,23 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
         if (selected_chunks[chunk_idx]) {
           selected_data_buffer_size += chunks[chunk_idx].buffer_size;
+        }
+      }
+    }
+    if (shared_pages_touched <= 1) {
+      for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
+        if (rows_by_page[page_idx].empty()) { continue; }
+        touched_page_indices.push_back(page_idx);
+        chunks_by_page[page_idx] = read_miniblock_chunks(source, column_info.pages[page_idx]);
+        auto const& chunks       = chunks_by_page[page_idx];
+        std::vector<bool> selected_chunks(chunks.size(), false);
+        for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
+          selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
+        }
+        for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+          if (selected_chunks[chunk_idx]) {
+            selected_data_buffer_size += chunks[chunk_idx].buffer_size;
+          }
         }
       }
     }
@@ -2647,8 +2700,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     auto* output_data = output->mutable_view().head<std::uint8_t>();
     output_columns.push_back(std::move(output));
 
-    for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
-      if (rows_by_page[page_idx].empty()) { continue; }
+    for (auto page_idx : touched_page_indices) {
       auto const& page = column_info.pages[page_idx];
       CUDF_EXPECTS(page.length <=
                      static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
