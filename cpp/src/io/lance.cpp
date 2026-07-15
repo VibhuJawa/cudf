@@ -992,7 +992,17 @@ lance_footer read_footer(datasource* source)
   return footer;
 }
 
-lance_file_info read_lance_file_info(datasource* source)
+bool should_parse_column_pages(lance_field_info const& field,
+                               std::vector<std::string> const& requested_columns)
+{
+  return field.is_supported() &&
+         (requested_columns.empty() ||
+          std::find(requested_columns.begin(), requested_columns.end(), field.name) !=
+            requested_columns.end());
+}
+
+lance_file_info read_lance_file_info(datasource* source,
+                                     std::vector<std::string> const& requested_columns)
 {
   auto const footer         = read_footer(source);
   auto const global_buffers = read_offset_table(
@@ -1027,14 +1037,15 @@ lance_file_info read_lance_file_info(datasource* source)
         info.columns.push_back(parse_column_metadata(
           proto_reader(metadata.data() + static_cast<std::size_t>(offset - begin),
                        static_cast<std::size_t>(size)),
-          info.fields[idx].is_supported()));
+          should_parse_column_pages(info.fields[idx], requested_columns)));
       }
     } else {
       for (std::size_t idx = 0; idx < column_offsets.size(); ++idx) {
         auto const& [offset, size] = column_offsets[idx];
         auto const metadata_bytes = read_host_bytes(source, offset, size);
-        info.columns.push_back(
-          parse_column_metadata(proto_reader(metadata_bytes), info.fields[idx].is_supported()));
+        info.columns.push_back(parse_column_metadata(
+          proto_reader(metadata_bytes),
+          should_parse_column_pages(info.fields[idx], requested_columns)));
       }
     }
   }
@@ -2361,7 +2372,7 @@ table_with_metadata read_lance(datasource* source,
 {
   CUDF_FUNC_RANGE();
 
-  auto const file_info = read_lance_file_info(source);
+  auto const file_info = read_lance_file_info(source, options.get_columns());
   auto const columns   = selected_columns(file_info, options);
   auto const rows      = options.has_row_selection() ? selected_rows(file_info, options)
                                                      : std::vector<size_type>{};
