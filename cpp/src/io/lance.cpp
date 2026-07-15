@@ -503,30 +503,16 @@ std::size_t pad_size(std::size_t size, std::size_t alignment = lance_buffer_alig
   return remainder == 0 ? 0 : alignment - remainder;
 }
 
-void write_padding(data_sink* sink, std::size_t size)
-{
-  static constexpr std::array<std::uint8_t, lance_buffer_alignment> pad = [] {
-    std::array<std::uint8_t, lance_buffer_alignment> data{};
-    data.fill(lance_pad_byte);
-    return data;
-  }();
-
-  while (size > 0) {
-    auto const chunk = std::min(size, pad.size());
-    sink->host_write(pad.data(), chunk);
-    size -= chunk;
-  }
-}
-
 void write_host_buffer(data_sink* sink, void const* data, std::size_t size)
 {
   if (size > 0) { sink->host_write(data, size); }
 }
 
-void write_aligned_host_buffer(data_sink* sink, void const* data, std::size_t size)
+void append_aligned_host_buffer(std::vector<std::uint8_t>& output,
+                                std::vector<std::uint8_t> const& data)
 {
-  write_host_buffer(sink, data, size);
-  write_padding(sink, pad_size(size));
+  output.insert(output.end(), data.begin(), data.end());
+  output.insert(output.end(), pad_size(data.size()), lance_pad_byte);
 }
 
 void write_device_buffer(data_sink* sink,
@@ -1643,7 +1629,8 @@ void read_dense_pages_values_into(datasource* source,
 }
 
 std::vector<page_metadata> write_column_pages(
-  data_sink* sink,
+  std::vector<std::uint8_t>& metadata_section,
+  std::uint64_t metadata_begin,
   std::vector<pending_miniblock_chunk> const& chunks,
   std::vector<pending_lance_page> const& pending_pages,
   std::size_t type_width,
@@ -1678,9 +1665,9 @@ std::vector<page_metadata> write_column_pages(
     page.encoding = make_page_encoding(
       type_width * 8, static_cast<std::uint64_t>(pending_page.num_rows), compression);
 
-    page.buffer_offsets.push_back(sink->bytes_written());
+    page.buffer_offsets.push_back(metadata_begin + metadata_section.size());
     page.buffer_sizes.push_back(metadata_buffer.size());
-    write_aligned_host_buffer(sink, metadata_buffer.data(), metadata_buffer.size());
+    append_aligned_host_buffer(metadata_section, metadata_buffer);
 
     CUDF_EXPECTS(data_size <= std::numeric_limits<std::size_t>::max(),
                  "Lance data buffer is too large");
@@ -1796,11 +1783,14 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
   std::vector<lance_pack_chunk> pack_chunks;
   pack_chunks.reserve(total_chunks);
   std::uint64_t data_size = 0;
+  auto const metadata_begin = sink->bytes_written();
+  std::vector<std::uint8_t> metadata_section;
   for (size_type col_idx = 0; col_idx < table.num_columns(); ++col_idx) {
     auto& pending_column = pending_columns[static_cast<std::size_t>(col_idx)];
     finalize_miniblock_chunks(pending_column.chunks);
     columns[col_idx].pages =
-      write_column_pages(sink,
+      write_column_pages(metadata_section,
+                         metadata_begin,
                          pending_column.chunks,
                          pending_column.pages,
                          pending_column.type_width,
@@ -1809,6 +1799,7 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
                          data_size);
   }
 
+  write_host_buffer(sink, metadata_section.data(), metadata_section.size());
   auto const data_begin = sink->bytes_written();
   for (auto& column : columns) {
     for (auto& page : column.pages) {
