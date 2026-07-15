@@ -38,7 +38,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1137,14 +1136,15 @@ void append_miniblock_metadata(std::vector<std::uint8_t>& metadata,
   write_little_endian_u32(metadata, metadata_word);
 }
 
-std::vector<miniblock_chunk_info> read_miniblock_chunks(datasource* source,
-                                                        lance_page_info const& page)
+std::vector<miniblock_chunk_info> parse_miniblock_chunks(std::uint8_t const* metadata,
+                                                         std::size_t metadata_size,
+                                                         lance_page_info const& page)
 {
-  auto const metadata = read_host_bytes(source, page.buffer_offsets[0], page.buffer_sizes[0]);
-  CUDF_EXPECTS(!metadata.empty() && metadata.size() % sizeof(std::uint32_t) == 0,
+  CUDF_EXPECTS((metadata_size == 0 && page.length == 0) ||
+                 (metadata_size > 0 && metadata_size % sizeof(std::uint32_t) == 0),
                "Invalid Lance MiniBlock metadata buffer");
 
-  auto const num_chunks = metadata.size() / sizeof(std::uint32_t);
+  auto const num_chunks = metadata_size / sizeof(std::uint32_t);
   std::vector<miniblock_chunk_info> chunks;
   chunks.reserve(num_chunks);
 
@@ -1153,7 +1153,7 @@ std::vector<miniblock_chunk_info> read_miniblock_chunks(datasource* source,
   auto const data_buf_begin = page.buffer_offsets[1];
   for (std::size_t idx = 0; idx < num_chunks; ++idx) {
     auto const metadata_word =
-      read_little_endian_u32(metadata.data() + (idx * sizeof(std::uint32_t)));
+      read_little_endian_u32(metadata + (idx * sizeof(std::uint32_t)));
     auto const log_num_values = static_cast<std::uint8_t>(metadata_word & 0xf);
     auto const chunk_size =
       ((static_cast<std::uint64_t>(metadata_word) >> 4) + 1) * miniblock_alignment;
@@ -1190,6 +1190,52 @@ std::vector<miniblock_chunk_info> read_miniblock_chunks(datasource* source,
   CUDF_EXPECTS(bytes_seen == page.buffer_sizes[1],
                "Lance MiniBlock metadata does not match data buffer size");
   return chunks;
+}
+
+std::vector<miniblock_chunk_info> read_miniblock_chunks(datasource* source,
+                                                        lance_page_info const& page)
+{
+  auto const metadata = read_host_bytes(source, page.buffer_offsets[0], page.buffer_sizes[0]);
+  return parse_miniblock_chunks(metadata.data(), metadata.size(), page);
+}
+
+std::vector<std::vector<miniblock_chunk_info>> read_miniblock_chunks(
+  datasource* source, std::vector<lance_page_info> const& pages)
+{
+  std::vector<std::vector<miniblock_chunk_info>> result(pages.size());
+  if (pages.empty()) { return result; }
+
+  std::uint64_t begin = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t end   = 0;
+  std::uint64_t total = 0;
+  for (auto const& page : pages) {
+    auto const offset = page.buffer_offsets[0];
+    auto const size   = page.buffer_sizes[0];
+    CUDF_EXPECTS(offset <= source->size() && size <= source->size() - offset,
+                 "Lance MiniBlock metadata range is out of bounds");
+    begin = std::min(begin, offset);
+    end   = std::max(end, offset + size);
+    total += size;
+  }
+
+  auto const span_size = end - begin;
+  auto const max_extra = std::max<std::uint64_t>(1 << 20, total / 8);
+  if (span_size <= total + max_extra) {
+    auto const metadata = read_host_bytes(source, begin, span_size);
+    for (std::size_t page_idx = 0; page_idx < pages.size(); ++page_idx) {
+      auto const& page = pages[page_idx];
+      auto const offset =
+        static_cast<std::size_t>(page.buffer_offsets[0] - begin);
+      result[page_idx] = parse_miniblock_chunks(
+        metadata.data() + offset, static_cast<std::size_t>(page.buffer_sizes[0]), page);
+    }
+    return result;
+  }
+
+  for (std::size_t page_idx = 0; page_idx < pages.size(); ++page_idx) {
+    result[page_idx] = read_miniblock_chunks(source, pages[page_idx]);
+  }
+  return result;
 }
 
 struct pending_miniblock_chunk {
@@ -1460,6 +1506,7 @@ void read_dense_page_values_into(datasource* source,
                  std::back_inserter(pages),
                  [](auto const& read) { return *read.page; });
   auto page_buffers = read_page_data_buffers(source, pages, stream, mr);
+  auto chunks_by_page = read_miniblock_chunks(source, pages);
 
   std::vector<device_span<std::uint8_t const>> inputs;
   std::vector<device_span<std::uint8_t>> outputs;
@@ -1476,7 +1523,7 @@ void read_dense_page_values_into(datasource* source,
     CUDF_EXPECTS(page.layout.bits_per_value == static_cast<std::uint64_t>(type_width * 8),
                  "Lance page encoding does not match schema type width");
 
-    auto const chunks = read_miniblock_chunks(source, page);
+    auto const& chunks = chunks_by_page[page_idx];
     auto const* page_data = page_buffers.pages[page_idx];
 
     for (auto const& chunk : chunks) {
@@ -1874,17 +1921,32 @@ bool should_use_dense_for_sparse_selection(lance_file_info const& file_info,
   }
   if (total_miniblocks == 0) { return false; }
 
-  std::unordered_set<std::uint64_t> selected_miniblocks;
-  selected_miniblocks.reserve(rows.size());
+  auto const dense_miniblock_threshold = (total_miniblocks + 1) / 2;
+  auto const [min_row, max_row]        = std::minmax_element(rows.begin(), rows.end());
+  auto const row_span =
+    static_cast<std::uint64_t>(*max_row) - static_cast<std::uint64_t>(*min_row);
+  auto const max_span_miniblocks = (row_span / default_rows_per_miniblock) + 1;
+  if (max_span_miniblocks < dense_miniblock_threshold) { return false; }
+
+  CUDF_EXPECTS(total_miniblocks <=
+                 static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
+               "Lance file contains too many MiniBlocks");
+  std::vector<std::uint8_t> selected_miniblocks(static_cast<std::size_t>(total_miniblocks), 0);
+  std::uint64_t selected_miniblock_count = 0;
   for (auto row : rows) {
     auto const page_idx    = find_page_for_row(column_info.pages, row);
     auto const& page       = column_info.pages[page_idx];
     auto const row_in_page = static_cast<std::uint64_t>(row) - page.priority;
-    selected_miniblocks.insert(page_miniblock_begins[page_idx] +
-                               (row_in_page / default_rows_per_miniblock));
+    auto const miniblock_idx = page_miniblock_begins[page_idx] +
+                               (row_in_page / default_rows_per_miniblock);
+    auto& selected = selected_miniblocks[static_cast<std::size_t>(miniblock_idx)];
+    if (selected == 0) {
+      selected = 1;
+      ++selected_miniblock_count;
+    }
   }
 
-  return selected_miniblocks.size() >= (total_miniblocks + 1) / 2;
+  return selected_miniblock_count >= dense_miniblock_threshold;
 }
 
 std::size_t find_miniblock_chunk_for_row(std::vector<miniblock_chunk_info> const& chunks,
