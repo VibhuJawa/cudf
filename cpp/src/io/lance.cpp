@@ -2046,6 +2046,8 @@ bool should_use_dense_for_sparse_selection(lance_file_info const& file_info,
   if (total_miniblocks == 0) { return false; }
 
   auto const dense_miniblock_threshold = (total_miniblocks + 1) / 2;
+  if (static_cast<std::uint64_t>(rows.size()) < dense_miniblock_threshold) { return false; }
+
   auto const [min_row, max_row]        = std::minmax_element(rows.begin(), rows.end());
   auto const row_span =
     static_cast<std::uint64_t>(*max_row) - static_cast<std::uint64_t>(*min_row);
@@ -2067,10 +2069,11 @@ bool should_use_dense_for_sparse_selection(lance_file_info const& file_info,
     if (selected == 0) {
       selected = 1;
       ++selected_miniblock_count;
+      if (selected_miniblock_count >= dense_miniblock_threshold) { return true; }
     }
   }
 
-  return selected_miniblock_count >= dense_miniblock_threshold;
+  return false;
 }
 
 bool can_batch_sparse_zstd_columns(lance_file_info const& file_info,
