@@ -13,6 +13,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <numeric>
 #include <string>
@@ -26,6 +27,16 @@ std::uint16_t read_u16_le(std::vector<char> const& buffer, std::size_t offset)
   return static_cast<std::uint16_t>(
     static_cast<std::uint8_t>(buffer[offset]) |
     (static_cast<std::uint16_t>(static_cast<std::uint8_t>(buffer[offset + 1])) << 8));
+}
+
+void replace_first(std::vector<char>& buffer,
+                   std::string const& needle,
+                   std::string const& replacement)
+{
+  ASSERT_EQ(needle.size(), replacement.size());
+  auto const found = std::search(buffer.begin(), buffer.end(), needle.begin(), needle.end());
+  ASSERT_NE(found, buffer.end());
+  std::copy(replacement.begin(), replacement.end(), found);
 }
 
 }  // namespace
@@ -132,6 +143,46 @@ TEST_F(LanceWriterTest, ReadsAllRowsWithoutSparseSelection)
   EXPECT_EQ(result.metadata.schema_info[1].name, "value");
   ASSERT_EQ(result.metadata.num_rows_per_source.size(), 1);
   EXPECT_EQ(result.metadata.num_rows_per_source[0], 8);
+}
+
+TEST_F(LanceWriterTest, ReadsProjectedColumnFromMixedSchema)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> unsupported({1, 2, 3, 4});
+  cudf::test::fixed_width_column_wrapper<int32_t> keep({10, 20, 30, 40});
+  cudf::table_view table({unsupported, keep});
+
+  cudf::io::table_metadata metadata;
+  metadata.schema_info.push_back(cudf::io::column_name_info{"unsupported", {}});
+  metadata.schema_info.push_back(cudf::io::column_name_info{"keep", {}});
+
+  std::vector<char> buffer;
+  auto write_options = cudf::io::experimental::lance_writer_options::builder(
+                         cudf::io::sink_info{&buffer}, table)
+                         .metadata(std::move(metadata))
+                         .compression(cudf::io::compression_type::NONE)
+                         .max_rows_per_page(2)
+                         .build();
+  cudf::io::experimental::write_lance(write_options);
+
+  replace_first(buffer, "int32", "strng");
+
+  auto all_columns_options = cudf::io::experimental::lance_reader_options::builder(
+                               cudf::io::source_info{
+                                 cudf::host_span<char>{buffer.data(), buffer.size()}})
+                               .build();
+  EXPECT_THROW(cudf::io::experimental::read_lance(all_columns_options), cudf::logic_error);
+
+  auto projected_options = cudf::io::experimental::lance_reader_options::builder(
+                             cudf::io::source_info{
+                               cudf::host_span<char>{buffer.data(), buffer.size()}})
+                             .columns({"keep"})
+                             .build();
+  auto result = cudf::io::experimental::read_lance(projected_options);
+
+  cudf::table_view expected({keep});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
+  ASSERT_EQ(result.metadata.schema_info.size(), 1);
+  EXPECT_EQ(result.metadata.schema_info[0].name, "keep");
 }
 
 TEST_F(LanceWriterTest, ReadsEmptySparseSelection)

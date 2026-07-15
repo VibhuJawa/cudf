@@ -88,6 +88,10 @@ def package_version(name: str) -> str | None:
         return None
 
 
+def rapids_package_version(name: str) -> str | None:
+    return package_version(name) or package_version(f"{name}-cu12")
+
+
 def storage_options_from_datamover(path: Path, location: str) -> dict[str, str]:
     config = yaml.safe_load(path.read_text())
     try:
@@ -195,6 +199,23 @@ def run_cudf_fixed_width_lane(
 ) -> None:
     cudf = try_import_cudf(skipped)
     if cudf is None:
+        return
+
+    missing_api = []
+    if not hasattr(cudf.DataFrame, "to_lance"):
+        missing_api.append("DataFrame.to_lance")
+    if not hasattr(cudf, "read_lance"):
+        missing_api.append("cudf.read_lance")
+    if missing_api:
+        skipped.append(
+            SkippedMeasurement(
+                name="cudf_fixed_width_lane",
+                reason=(
+                    "installed cuDF is missing the experimental Lance API: "
+                    + ", ".join(missing_api)
+                ),
+            )
+        )
         return
 
     try:
@@ -444,7 +465,9 @@ def main() -> None:
             or package_version("pylance")
             or package_version("lance"),
             "pyarrow": package_version("pyarrow"),
-            "cudf": package_version("cudf"),
+            "cudf": rapids_package_version("cudf"),
+            "pylibcudf": rapids_package_version("pylibcudf"),
+            "rmm": rapids_package_version("rmm"),
         },
         "measurements": [asdict(item) for item in measurements],
         "skipped_measurements": [asdict(item) for item in skipped],

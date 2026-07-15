@@ -249,7 +249,7 @@ std::string logical_type(data_type type)
   }
 }
 
-data_type data_type_from_lance_logical_type(std::string const& logical_type)
+std::optional<data_type> data_type_from_lance_logical_type(std::string const& logical_type)
 {
   if (logical_type == "int8") { return data_type{type_id::INT8}; }
   if (logical_type == "int16") { return data_type{type_id::INT16}; }
@@ -261,7 +261,7 @@ data_type data_type_from_lance_logical_type(std::string const& logical_type)
   if (logical_type == "uint64") { return data_type{type_id::UINT64}; }
   if (logical_type == "float") { return data_type{type_id::FLOAT32}; }
   if (logical_type == "double") { return data_type{type_id::FLOAT64}; }
-  CUDF_FAIL("Unsupported Lance logical type: " + logical_type);
+  return std::nullopt;
 }
 
 bool is_supported_lance_type(data_type type)
@@ -421,8 +421,15 @@ class proto_reader {
 
 struct lance_field_info {
   std::string name;
-  data_type type;
+  std::optional<data_type> type;
   bool nullable{};
+  std::string logical_type;
+  std::string unsupported_reason;
+
+  [[nodiscard]] bool is_supported() const noexcept
+  {
+    return type.has_value() && unsupported_reason.empty();
+  }
 };
 
 struct lance_page_layout {
@@ -808,8 +815,15 @@ lance_field_info parse_field(proto_reader reader)
   CUDF_EXPECTS(parent_id == -1, "Only top-level Lance fields are supported");
   CUDF_EXPECTS(!name.empty(), "Lance field is missing a name");
   CUDF_EXPECTS(!logical.empty(), "Lance field is missing a logical type");
-  CUDF_EXPECTS(!nullable, "Lance reader currently supports only non-nullable fields");
-  return lance_field_info{name, data_type_from_lance_logical_type(logical), nullable};
+  auto dtype = data_type_from_lance_logical_type(logical);
+  std::string unsupported_reason;
+  if (nullable) { unsupported_reason = "nullable field"; }
+  if (!dtype.has_value()) {
+    if (!unsupported_reason.empty()) { unsupported_reason += "; "; }
+    unsupported_reason += "unsupported logical type: " + logical;
+  }
+  if (!unsupported_reason.empty()) { dtype = std::nullopt; }
+  return lance_field_info{name, dtype, nullable, logical, unsupported_reason};
 }
 
 std::vector<lance_field_info> parse_schema(proto_reader reader)
@@ -882,7 +896,7 @@ lance_page_info parse_page_metadata(proto_reader reader)
   return page;
 }
 
-lance_column_info parse_column_metadata(std::vector<std::uint8_t> const& bytes)
+lance_column_info parse_column_metadata(std::vector<std::uint8_t> const& bytes, bool parse_pages)
 {
   lance_column_info column;
   proto_reader reader(bytes);
@@ -891,7 +905,11 @@ lance_column_info parse_column_metadata(std::vector<std::uint8_t> const& bytes)
   while (reader.next(field, type)) {
     if (field == 2) {
       expect_wire_type(type, wire_type::length_delimited, "ColumnMetadata.pages");
-      column.pages.push_back(parse_page_metadata(reader.read_message()));
+      if (parse_pages) {
+        column.pages.push_back(parse_page_metadata(reader.read_message()));
+      } else {
+        reader.skip(type);
+      }
     } else {
       reader.skip(type);
     }
@@ -982,8 +1000,11 @@ lance_file_info read_lance_file_info(datasource* source)
   auto const column_offsets =
     read_offset_table(source, footer.cmo_table_start, footer.num_columns);
   info.columns.reserve(footer.num_columns);
-  for (auto const& [offset, size] : column_offsets) {
-    info.columns.push_back(parse_column_metadata(read_host_bytes(source, offset, size)));
+  for (std::size_t idx = 0; idx < column_offsets.size(); ++idx) {
+    auto const& [offset, size] = column_offsets[idx];
+    auto const metadata_bytes = read_host_bytes(source, offset, size);
+    info.columns.push_back(
+      parse_column_metadata(metadata_bytes, info.fields[idx].is_supported()));
   }
   CUDF_EXPECTS(info.columns.size() == info.fields.size(),
                "Lance column metadata count does not match schema field count");
@@ -1485,6 +1506,11 @@ std::vector<size_type> selected_columns(lance_file_info const& file_info,
     CUDF_EXPECTS(file_info.fields.size() <=
                    static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
                  "Lance file contains too many columns for cuDF");
+    for (auto const& field : file_info.fields) {
+      CUDF_EXPECTS(field.is_supported(),
+                   "Lance column requires explicit projection or unsupported column handling: " +
+                     field.name + " (" + field.unsupported_reason + ")");
+    }
     columns.resize(file_info.fields.size());
     std::iota(columns.begin(), columns.end(), 0);
     return columns;
@@ -1501,6 +1527,10 @@ std::vector<size_type> selected_columns(lance_file_info const& file_info,
   for (auto const& name : requested) {
     auto found = field_indices.find(name);
     CUDF_EXPECTS(found != field_indices.end(), "Requested Lance column not found: " + name);
+    auto const& field = file_info.fields[found->second];
+    CUDF_EXPECTS(field.is_supported(),
+                 "Requested Lance column is not supported: " + field.name + " (" +
+                   field.unsupported_reason + ")");
     columns.push_back(found->second);
   }
   return columns;
@@ -1534,11 +1564,15 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
+  CUDF_EXPECTS(field.type.has_value(),
+               "Unsupported Lance column selected: " + field.name + " (" +
+                 field.unsupported_reason + ")");
+  auto const field_type = *field.type;
   CUDF_EXPECTS(num_rows <= static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
                "Lance file contains too many rows for cuDF");
   if (num_rows == 0) {
     return cudf::make_fixed_width_column(
-      field.type, 0, mask_state::UNALLOCATED, stream, mr);
+      field_type, 0, mask_state::UNALLOCATED, stream, mr);
   }
 
   std::vector<std::unique_ptr<column>> page_columns;
@@ -1554,8 +1588,8 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                    static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
                  "Lance page contains too many rows for cuDF");
 
-    auto page_values = read_page_values(source, page, field.type, stream, mr);
-    auto page_column = std::make_unique<column>(field.type,
+    auto page_values = read_page_values(source, page, field_type, stream, mr);
+    auto page_column = std::make_unique<column>(field_type,
                                                 static_cast<size_type>(page.length),
                                                 page_values.release(),
                                                 rmm::device_buffer{},
@@ -1578,8 +1612,12 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
+  CUDF_EXPECTS(field.type.has_value(),
+               "Unsupported Lance column selected: " + field.name + " (" +
+                 field.unsupported_reason + ")");
+  auto const field_type = *field.type;
   auto output = cudf::make_fixed_width_column(
-    field.type, static_cast<size_type>(rows.size()), mask_state::UNALLOCATED, stream, mr);
+    field_type, static_cast<size_type>(rows.size()), mask_state::UNALLOCATED, stream, mr);
   if (rows.empty()) { return output; }
 
   std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_page(column_info.pages.size());
@@ -1591,7 +1629,7 @@ std::unique_ptr<column> read_lance_column(datasource* source,
     rows_by_page[page_idx].emplace_back(output_row, row_in_page);
   }
 
-  auto const type_width = cudf::size_of(field.type);
+  auto const type_width = cudf::size_of(field_type);
   CUDF_CUDA_TRY(cudaMemsetAsync(output->mutable_view().head<std::uint8_t>(),
                                 0,
                                 rows.size() * type_width,
@@ -1617,7 +1655,7 @@ std::unique_ptr<column> read_lance_column(datasource* source,
       CUDF_EXPECTS(chunk.num_rows <=
                      static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()),
                    "Lance MiniBlock contains too many rows for cuDF");
-      auto chunk_values = read_miniblock_chunk_values(source, page, chunk, field.type, stream, mr);
+      auto chunk_values = read_miniblock_chunk_values(source, page, chunk, field_type, stream, mr);
 
       std::vector<size_type> source_rows;
       std::vector<size_type> target_rows;
@@ -1631,7 +1669,7 @@ std::unique_ptr<column> read_lance_column(datasource* source,
       auto source_map = cudf::detail::make_device_uvector(source_rows, stream, mr);
       auto target_map = cudf::detail::make_device_uvector(target_rows, stream, mr);
       auto chunk_view = column_view{
-        field.type, static_cast<size_type>(chunk.num_rows), chunk_values.data(), nullptr, 0};
+        field_type, static_cast<size_type>(chunk.num_rows), chunk_values.data(), nullptr, 0};
       auto gathered = cudf::detail::gather(table_view{{chunk_view}},
                                            device_span<size_type const>{
                                              source_map.data(), source_map.size()},

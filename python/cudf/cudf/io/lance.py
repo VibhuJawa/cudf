@@ -114,10 +114,12 @@ def read_lance(
 ) -> DataFrame:
     """Read a Lance data file using libcudf.
 
-    This experimental reader currently supports the non-null top-level integer
-    and floating-point Lance files emitted by :func:`to_lance`. If ``rows`` is
-    supplied, libcudf reads only MiniBlock chunks containing those zero-based
-    row ids and returns rows in the supplied order.
+    This experimental reader currently supports non-null top-level integer and
+    floating-point columns in self-described Lance v2.2 data files. Projected
+    reads may select supported fixed-width columns from mixed schemas; selecting
+    unsupported columns still raises. If ``rows`` is supplied, libcudf reads only
+    MiniBlock chunks containing those zero-based row ids and returns rows in the
+    supplied order.
     """
     path_or_buf = ioutils.get_reader_filepath_or_buffer(
         path_or_data=filepath_or_buffer,

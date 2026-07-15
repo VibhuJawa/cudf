@@ -212,9 +212,10 @@ class lance_reader_options_builder;
 /**
  * @brief Settings for `read_lance()`.
  *
- * The initial experimental reader supports the fixed-width, non-null Lance v2.2 files emitted by
- * `write_lance()`.  When row indices are supplied, the reader performs sparse page and MiniBlock
- * lookup and reads only chunks containing selected rows.
+ * The initial experimental reader supports non-null fixed-width top-level columns in
+ * self-described Lance v2.2 files, including projected reads from mixed schemas that also contain
+ * unsupported column types. When row indices are supplied, the reader performs sparse page and
+ * MiniBlock lookup and reads only chunks containing selected rows.
  */
 class lance_reader_options {
   source_info _source;
