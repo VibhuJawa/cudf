@@ -2694,15 +2694,42 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         input_buffers.emplace_back(input_buffer_size, stream, mr);
         std::size_t input_offset = 0;
         if (use_batched_sparse_headers) {
-          for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
-            auto const& chunk = selected_chunks[idx].chunk;
-            input_offsets[idx] = input_offset;
-            read_device_bytes_into(source,
-                                   chunk.buffer_offset,
-                                   chunk.buffer_size,
-                                   input_buffers.back().data() + input_offset,
-                                   stream);
-            input_offset += static_cast<std::size_t>(chunk.buffer_size);
+          auto const coalesce_adjacent_miniblock_reads =
+            type_width <= sizeof(std::uint32_t) && selected_chunks.size() > 1;
+          if (coalesce_adjacent_miniblock_reads) {
+            for (std::size_t idx = 0; idx < selected_chunks.size();) {
+              auto const range_begin_idx = idx;
+              auto range_offset          = selected_chunks[idx].chunk.buffer_offset;
+              auto range_size            = selected_chunks[idx].chunk.buffer_size;
+              input_offsets[idx]         = input_offset;
+              auto range_chunks          = 1;
+              ++idx;
+              while (idx < selected_chunks.size() &&
+                     range_chunks < 2 &&
+                     selected_chunks[idx].chunk.buffer_offset == range_offset + range_size) {
+                input_offsets[idx] = input_offset + static_cast<std::size_t>(range_size);
+                range_size += selected_chunks[idx].chunk.buffer_size;
+                ++range_chunks;
+                ++idx;
+              }
+              read_device_bytes_into(source,
+                                     range_offset,
+                                     range_size,
+                                     input_buffers.back().data() + input_offsets[range_begin_idx],
+                                     stream);
+              input_offset += static_cast<std::size_t>(range_size);
+            }
+          } else {
+            for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
+              auto const& chunk = selected_chunks[idx].chunk;
+              input_offsets[idx] = input_offset;
+              read_device_bytes_into(source,
+                                     chunk.buffer_offset,
+                                     chunk.buffer_size,
+                                     input_buffers.back().data() + input_offset,
+                                     stream);
+              input_offset += static_cast<std::size_t>(chunk.buffer_size);
+            }
           }
         } else {
           for (std::size_t idx = 0; idx < selected.size(); ++idx) {
