@@ -120,6 +120,27 @@ constexpr std::array<std::uint8_t, 4> lance_magic{'L', 'A', 'N', 'C'};
 
 enum class wire_type : std::uint8_t { varint = 0, fixed64 = 1, length_delimited = 2, fixed32 = 5 };
 
+std::size_t count_selected_miniblock_read_ranges(std::vector<bool> const& selected_chunks,
+                                                 bool coalesce_adjacent)
+{
+  std::size_t range_count = 0;
+  for (std::size_t idx = 0; idx < selected_chunks.size();) {
+    if (!selected_chunks[idx]) {
+      ++idx;
+      continue;
+    }
+    ++range_count;
+    auto range_chunks = std::size_t{1};
+    ++idx;
+    while (coalesce_adjacent && idx < selected_chunks.size() &&
+           range_chunks < sparse_max_coalesced_miniblock_reads && selected_chunks[idx]) {
+      ++range_chunks;
+      ++idx;
+    }
+  }
+  return range_count;
+}
+
 class proto_writer {
  public:
   [[nodiscard]] std::vector<std::uint8_t> const& buffer() const noexcept { return _buffer; }
@@ -2695,6 +2716,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     std::uint64_t total_data_buffer_size    = 0;
     std::uint64_t selected_data_buffer_size = 0;
     std::size_t selected_miniblock_count    = 0;
+    std::size_t selected_miniblock_read_range_count = 0;
     std::size_t selected_raw_value_size     = 0;
     std::vector<std::vector<miniblock_chunk_info>> chunks_by_page(column_info.pages.size());
     std::vector<std::size_t> selected_chunk_counts_by_page(column_info.pages.size(), 0);
@@ -2714,6 +2736,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
       }
       auto selected_chunk_count = std::size_t{0};
+      selected_miniblock_read_range_count += count_selected_miniblock_read_ranges(
+        selected_chunks, type_width <= sizeof(std::uint32_t));
       for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
         if (selected_chunks[chunk_idx]) {
           auto const& chunk = chunks[chunk_idx];
@@ -2740,6 +2764,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
         }
         auto selected_chunk_count = std::size_t{0};
+        selected_miniblock_read_range_count += count_selected_miniblock_read_ranges(
+          selected_chunks, type_width <= sizeof(std::uint32_t));
         for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
           if (selected_chunks[chunk_idx]) {
             auto const& chunk = chunks[chunk_idx];
@@ -2797,10 +2823,14 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
 
     std::uint64_t sparse_page_span_begin = 0;
     std::uint8_t const* sparse_page_span_data = nullptr;
+    auto const use_selected_narrow_ranges =
+      type_width <= sizeof(std::uint32_t) &&
+      selected_miniblock_read_range_count <= touched_page_indices.size();
     if (use_batched_sparse_headers &&
         touched_page_indices.size() >= sparse_page_span_min_pages &&
         selected_miniblock_count >=
-          touched_page_indices.size() * sparse_page_span_min_chunks_per_page) {
+          touched_page_indices.size() * sparse_page_span_min_chunks_per_page &&
+        !use_selected_narrow_ranges) {
       std::uint64_t span_begin = std::numeric_limits<std::uint64_t>::max();
       std::uint64_t span_end   = 0;
       for (auto page_idx : touched_page_indices) {
