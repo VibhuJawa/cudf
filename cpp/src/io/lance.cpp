@@ -917,10 +917,9 @@ lance_page_info parse_page_metadata(proto_reader reader)
   return page;
 }
 
-lance_column_info parse_column_metadata(std::vector<std::uint8_t> const& bytes, bool parse_pages)
+lance_column_info parse_column_metadata(proto_reader reader, bool parse_pages)
 {
   lance_column_info column;
-  proto_reader reader(bytes);
   int field{};
   wire_type type{};
   while (reader.next(field, type)) {
@@ -1021,11 +1020,37 @@ lance_file_info read_lance_file_info(datasource* source)
   auto const column_offsets =
     read_offset_table(source, footer.cmo_table_start, footer.num_columns);
   info.columns.reserve(footer.num_columns);
-  for (std::size_t idx = 0; idx < column_offsets.size(); ++idx) {
-    auto const& [offset, size] = column_offsets[idx];
-    auto const metadata_bytes = read_host_bytes(source, offset, size);
-    info.columns.push_back(
-      parse_column_metadata(metadata_bytes, info.fields[idx].is_supported()));
+  if (!column_offsets.empty()) {
+    std::uint64_t begin = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t end   = 0;
+    std::uint64_t total = 0;
+    for (auto const& [offset, size] : column_offsets) {
+      CUDF_EXPECTS(offset <= source->size() && size <= source->size() - offset,
+                   "Lance column metadata range is out of bounds");
+      begin = std::min(begin, offset);
+      end   = std::max(end, offset + size);
+      total += size;
+    }
+
+    auto const span_size = end - begin;
+    auto const max_extra = std::max<std::uint64_t>(1 << 20, total / 8);
+    if (span_size <= total + max_extra) {
+      auto const metadata = read_host_bytes(source, begin, span_size);
+      for (std::size_t idx = 0; idx < column_offsets.size(); ++idx) {
+        auto const& [offset, size] = column_offsets[idx];
+        info.columns.push_back(parse_column_metadata(
+          proto_reader(metadata.data() + static_cast<std::size_t>(offset - begin),
+                       static_cast<std::size_t>(size)),
+          info.fields[idx].is_supported()));
+      }
+    } else {
+      for (std::size_t idx = 0; idx < column_offsets.size(); ++idx) {
+        auto const& [offset, size] = column_offsets[idx];
+        auto const metadata_bytes = read_host_bytes(source, offset, size);
+        info.columns.push_back(
+          parse_column_metadata(proto_reader(metadata_bytes), info.fields[idx].is_supported()));
+      }
+    }
   }
   CUDF_EXPECTS(info.columns.size() == info.fields.size(),
                "Lance column metadata count does not match schema field count");
