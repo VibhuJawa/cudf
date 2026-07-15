@@ -116,11 +116,13 @@ constexpr std::size_t sparse_header_batch_min_reads = 8;
 constexpr std::size_t sparse_multi_column_header_batch_min_reads = 2;
 constexpr std::size_t sparse_copy_batch_min_chunks = 2;
 constexpr std::size_t sparse_max_coalesced_miniblock_reads = 4;
+constexpr std::size_t sparse_page_selected_span_min_chunks = 4;
 constexpr std::size_t sparse_stack_miniblock_count = 64;
 constexpr std::size_t sparse_page_span_min_pages = 16;
 constexpr std::size_t sparse_page_span_min_chunks_per_page = 2;
 constexpr std::uint64_t sparse_page_span_max_bytes = std::uint64_t{64} << 20;
 constexpr std::uint64_t sparse_page_span_max_overread_ratio = 2;
+constexpr std::uint64_t sparse_page_selected_span_max_overread_ratio = 4;
 constexpr std::size_t sparse_host_staging_min_reads = 32;
 constexpr std::uint64_t sparse_host_staging_max_read_bytes = std::uint64_t{256} << 10;
 constexpr std::uint64_t sparse_host_staging_max_total_bytes = std::uint64_t{64} << 20;
@@ -3067,6 +3069,72 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       }
     }
 
+    std::uint64_t selected_input_buffer_size = selected_data_buffer_size;
+    std::vector<std::uint64_t> selected_input_sizes_by_page;
+    std::vector<std::uint64_t> selected_span_offsets_by_page;
+    std::vector<std::uint8_t> use_selected_span_by_page;
+    // Patterned sparse reads can be faster as one bounded span per page, but random lookups should
+    // keep the narrower MiniBlock ranges. Only enable spans when most touched pages can use them.
+    auto selected_span_candidate_pages = std::size_t{0};
+    auto const may_use_selected_page_spans =
+      use_batched_sparse_headers && sparse_page_span_data == nullptr &&
+      selected_data_buffer_size > 0 &&
+      selected_miniblock_count / sparse_page_selected_span_min_chunks >=
+        touched_page_indices.size();
+    if (may_use_selected_page_spans) {
+      selected_span_candidate_pages = static_cast<std::size_t>(std::count_if(
+        touched_page_indices.begin(), touched_page_indices.end(), [&](auto page_idx) {
+          return selected_chunk_counts_by_page[page_idx] >= sparse_page_selected_span_min_chunks;
+        }));
+    }
+    auto const has_selected_span_candidate =
+      may_use_selected_page_spans && selected_span_candidate_pages > 0 &&
+      selected_span_candidate_pages * 2 >= touched_page_indices.size();
+    if (has_selected_span_candidate) {
+      selected_input_buffer_size = 0;
+      selected_input_sizes_by_page.assign(column_info.pages.size(), 0);
+      selected_span_offsets_by_page.assign(column_info.pages.size(), 0);
+      use_selected_span_by_page.assign(column_info.pages.size(), 0);
+
+      for (auto page_idx : touched_page_indices) {
+        auto const& page   = column_info.pages[page_idx];
+        auto const& chunks = chunks_by_page[page_idx];
+        std::vector<bool> selected_chunks(chunks.size(), false);
+        for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
+          selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
+        }
+
+        auto page_selected_buffer_size = std::uint64_t{0};
+        auto span_begin                = std::numeric_limits<std::uint64_t>::max();
+        auto span_end                  = std::uint64_t{0};
+        auto selected_chunk_count      = std::size_t{0};
+        for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+          if (!selected_chunks[chunk_idx]) { continue; }
+          auto const& chunk = chunks[chunk_idx];
+          page_selected_buffer_size += chunk.buffer_size;
+          span_begin = std::min(span_begin, chunk.buffer_offset);
+          span_end   = std::max(span_end, chunk.buffer_offset + chunk.buffer_size);
+          ++selected_chunk_count;
+        }
+
+        auto page_input_size = page_selected_buffer_size;
+        if (selected_chunk_count >= sparse_page_selected_span_min_chunks) {
+          auto const span_size = span_end - span_begin;
+          if (span_size <= page.buffer_sizes[1] &&
+              (span_size + sparse_page_selected_span_max_overread_ratio - 1) /
+                  sparse_page_selected_span_max_overread_ratio <=
+                page_selected_buffer_size) {
+            use_selected_span_by_page[page_idx]     = 1;
+            selected_span_offsets_by_page[page_idx] = span_begin;
+            page_input_size                         = span_size;
+          }
+        }
+
+        selected_input_sizes_by_page[page_idx] = page_input_size;
+        selected_input_buffer_size += page_input_size;
+      }
+    }
+
     auto output = cudf::make_fixed_width_column(field_type,
                                                 static_cast<size_type>(rows.size()),
                                                 mask_state::UNALLOCATED,
@@ -3084,11 +3152,11 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
     std::uint8_t* sparse_input_data = nullptr;
     std::size_t sparse_input_offset = 0;
     if (use_batched_sparse_headers && sparse_page_span_data == nullptr &&
-        selected_data_buffer_size > 0) {
-      CUDF_EXPECTS(selected_data_buffer_size <=
+        selected_input_buffer_size > 0) {
+      CUDF_EXPECTS(selected_input_buffer_size <=
                      static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
                    "Lance sparse input buffer is too large");
-      input_buffers.emplace_back(static_cast<std::size_t>(selected_data_buffer_size), stream, mr);
+      input_buffers.emplace_back(static_cast<std::size_t>(selected_input_buffer_size), stream, mr);
       sparse_input_data = input_buffers.back().data();
     }
 
@@ -3292,12 +3360,18 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           }
         }
       } else {
+        auto const use_selected_span =
+          !use_selected_span_by_page.empty() && use_selected_span_by_page[page_idx] != 0;
         auto const input_buffer_size =
-          use_batched_sparse_headers ? total_miniblock_size : total_payload_size;
+          use_batched_sparse_headers
+            ? (!selected_input_sizes_by_page.empty()
+                 ? static_cast<std::size_t>(selected_input_sizes_by_page[page_idx])
+                 : total_miniblock_size)
+            : total_payload_size;
         std::uint8_t* page_input_data = nullptr;
         if (use_batched_sparse_headers && sparse_input_data != nullptr) {
           CUDF_EXPECTS(input_buffer_size <=
-                         static_cast<std::size_t>(selected_data_buffer_size) -
+                         static_cast<std::size_t>(selected_input_buffer_size) -
                            sparse_input_offset,
                        "Invalid Lance sparse input buffer offset");
           page_input_data = sparse_input_data + sparse_input_offset;
@@ -3309,8 +3383,20 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         }
         std::size_t input_offset = 0;
         if (use_batched_sparse_headers) {
-          auto const coalesce_adjacent_miniblock_reads = selected_chunks.size() > 1;
-          if (coalesce_adjacent_miniblock_reads) {
+          if (use_selected_span) {
+            auto const range_offset = selected_span_offsets_by_page[page_idx];
+            for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
+              auto const& chunk = selected_chunks[idx].chunk;
+              CUDF_EXPECTS(chunk.buffer_offset >= range_offset &&
+                             chunk.buffer_size <= input_buffer_size &&
+                             chunk.buffer_offset - range_offset <=
+                               input_buffer_size - chunk.buffer_size,
+                           "Lance MiniBlock is outside the selected sparse page span");
+              input_offsets[idx] = static_cast<std::size_t>(chunk.buffer_offset - range_offset);
+            }
+            pending_sparse_device_reads.push_back(
+              pending_device_read{range_offset, input_buffer_size, page_input_data});
+          } else if (selected_chunks.size() > 1) {
             for (std::size_t idx = 0; idx < selected_chunks.size();) {
               auto const range_begin_idx = idx;
               auto range_offset          = selected_chunks[idx].chunk.buffer_offset;
