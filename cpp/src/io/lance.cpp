@@ -2787,18 +2787,18 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   }
 
   if (!page_copies.empty()) {
-    std::vector<rmm::device_uvector<size_type>> source_maps;
-    std::vector<rmm::device_uvector<size_type>> target_maps;
-    source_maps.reserve(source_rows_by_page.size());
-    target_maps.reserve(target_rows_by_page.size());
-    for (std::size_t idx = 0; idx < source_rows_by_page.size(); ++idx) {
-      source_maps.push_back(
-        cudf::detail::make_device_uvector(source_rows_by_page[idx], stream, mr));
-      target_maps.push_back(
-        cudf::detail::make_device_uvector(target_rows_by_page[idx], stream, mr));
-    }
-
     if (page_copies.size() < sparse_copy_batch_min_chunks) {
+      std::vector<rmm::device_uvector<size_type>> source_maps;
+      std::vector<rmm::device_uvector<size_type>> target_maps;
+      source_maps.reserve(source_rows_by_page.size());
+      target_maps.reserve(target_rows_by_page.size());
+      for (std::size_t idx = 0; idx < source_rows_by_page.size(); ++idx) {
+        source_maps.push_back(
+          cudf::detail::make_device_uvector(source_rows_by_page[idx], stream, mr));
+        target_maps.push_back(
+          cudf::detail::make_device_uvector(target_rows_by_page[idx], stream, mr));
+      }
+
       for (auto const& copy : page_copies) {
         copy_sparse_fixed_width(copy.page_values,
                                 copy.output,
@@ -2812,18 +2812,43 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       constexpr size_type block_size = 256;
       constexpr auto max_blocks_per_chunk = 65535u;
       unsigned int blocks_per_chunk       = 1;
+
+      std::size_t total_map_rows = 0;
+      for (auto const& source_rows : source_rows_by_page) {
+        total_map_rows += source_rows.size();
+      }
+      std::vector<std::size_t> row_map_offsets;
+      std::vector<size_type> flat_source_rows;
+      std::vector<size_type> flat_target_rows;
+      row_map_offsets.reserve(source_rows_by_page.size());
+      flat_source_rows.reserve(total_map_rows);
+      flat_target_rows.reserve(total_map_rows);
+      for (std::size_t idx = 0; idx < source_rows_by_page.size(); ++idx) {
+        row_map_offsets.push_back(flat_source_rows.size());
+        flat_source_rows.insert(flat_source_rows.end(),
+                                source_rows_by_page[idx].begin(),
+                                source_rows_by_page[idx].end());
+        flat_target_rows.insert(flat_target_rows.end(),
+                                target_rows_by_page[idx].begin(),
+                                target_rows_by_page[idx].end());
+      }
+
+      auto source_map = cudf::detail::make_device_uvector(flat_source_rows, stream, mr);
+      auto target_map = cudf::detail::make_device_uvector(flat_target_rows, stream, mr);
+
       std::vector<lance_sparse_copy_chunk> copy_chunks;
       copy_chunks.reserve(page_copies.size());
       for (auto const& copy : page_copies) {
-        auto const num_rows = static_cast<size_type>(source_maps[copy.row_map_idx].size());
+        auto const num_rows = static_cast<size_type>(source_rows_by_page[copy.row_map_idx].size());
         auto const chunk_blocks =
           static_cast<unsigned int>(std::min<size_type>(
             (num_rows + block_size - 1) / block_size, max_blocks_per_chunk));
         blocks_per_chunk = std::max(blocks_per_chunk, chunk_blocks);
+        auto const row_map_offset = row_map_offsets[copy.row_map_idx];
         copy_chunks.push_back(lance_sparse_copy_chunk{copy.page_values,
                                                       copy.output,
-                                                      source_maps[copy.row_map_idx].data(),
-                                                      target_maps[copy.row_map_idx].data(),
+                                                      source_map.data() + row_map_offset,
+                                                      target_map.data() + row_map_offset,
                                                       num_rows,
                                                       copy.type_width});
       }
