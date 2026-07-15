@@ -95,7 +95,7 @@ constexpr std::uint32_t default_rows_per_page = 64 * 1024;
 constexpr std::uint32_t default_rows_per_miniblock = 4096;
 constexpr std::uint8_t default_rows_per_miniblock_log = 12;
 constexpr std::size_t sparse_header_batch_min_reads = 8;
-constexpr std::size_t sparse_copy_batch_min_chunks = 8;
+constexpr std::size_t sparse_copy_batch_min_chunks = 2;
 constexpr std::size_t miniblock_alignment = 8;
 constexpr std::array<std::uint8_t, 4> lance_magic{'L', 'A', 'N', 'C'};
 
