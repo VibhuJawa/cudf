@@ -39,9 +39,9 @@ class lance_writer_options_builder;
  * @brief Settings for `write_lance()`.
  *
  * The initial experimental writer emits a self-described Lance v2.2 data file for non-null,
- * top-level fixed-width columns.  Page payloads use Lance MiniBlock layout so ZSTD compression can
- * be applied by cuDF's device compression path and decoded by Lance's existing block-compression
- * reader.
+ * top-level fixed-width columns.  Page payloads use Lance v2.2 MiniBlock chunks so ZSTD
+ * compression can be applied by cuDF's device compression path and decoded by Lance's existing
+ * block-compression reader.
  */
 class lance_writer_options {
   sink_info _sink;
@@ -213,8 +213,8 @@ class lance_reader_options_builder;
  * @brief Settings for `read_lance()`.
  *
  * The initial experimental reader supports the fixed-width, non-null Lance v2.2 files emitted by
- * `write_lance()`.  When row indices are supplied, the reader performs sparse page lookup and reads
- * only pages containing selected rows.
+ * `write_lance()`.  When row indices are supplied, the reader performs sparse page and MiniBlock
+ * lookup and reads only chunks containing selected rows.
  */
 class lance_reader_options {
   source_info _source;

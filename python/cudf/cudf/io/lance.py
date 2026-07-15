@@ -116,8 +116,8 @@ def read_lance(
 
     This experimental reader currently supports the non-null top-level integer
     and floating-point Lance files emitted by :func:`to_lance`. If ``rows`` is
-    supplied, libcudf reads only pages containing those zero-based row ids and
-    returns rows in the supplied order.
+    supplied, libcudf reads only MiniBlock chunks containing those zero-based
+    row ids and returns rows in the supplied order.
     """
     path_or_buf = ioutils.get_reader_filepath_or_buffer(
         path_or_data=filepath_or_buffer,

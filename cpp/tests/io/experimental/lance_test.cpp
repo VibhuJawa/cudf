@@ -14,6 +14,7 @@
 #include <cudf/utilities/span.hpp>
 
 #include <cstdint>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -156,6 +157,32 @@ TEST_F(LanceWriterTest, ReadsEmptySparseSelection)
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
   ASSERT_EQ(result.metadata.num_rows_per_source.size(), 1);
   EXPECT_EQ(result.metadata.num_rows_per_source[0], 0);
+}
+
+TEST_F(LanceWriterTest, ReadsSparseRowsAcrossMiniBlockChunks)
+{
+  std::vector<int32_t> values(5000);
+  std::iota(values.begin(), values.end(), 0);
+  cudf::test::fixed_width_column_wrapper<int32_t> col(values.begin(), values.end());
+  cudf::table_view table({col});
+
+  std::vector<char> buffer;
+  auto write_options = cudf::io::experimental::lance_writer_options::builder(
+                         cudf::io::sink_info{&buffer}, table)
+                         .compression(cudf::io::compression_type::NONE)
+                         .max_rows_per_page(5000)
+                         .build();
+  cudf::io::experimental::write_lance(write_options);
+
+  auto read_options = cudf::io::experimental::lance_reader_options::builder(
+                        cudf::io::source_info{cudf::host_span<char>{buffer.data(), buffer.size()}})
+                        .rows({0, 4095, 4096, 4999, 4096})
+                        .build();
+  auto result = cudf::io::experimental::read_lance(read_options);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> expected({0, 4095, 4096, 4999, 4096});
+  cudf::table_view expected_table({expected});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected_table, result.tbl->view());
 }
 
 TEST_F(LanceWriterTest, RejectsUnsupportedCompression)
