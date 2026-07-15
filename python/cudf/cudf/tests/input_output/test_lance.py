@@ -59,7 +59,10 @@ def test_read_lance_sparse_rows_and_columns(tmp_path):
 
 def test_read_lance_sparse_zstd_many_pages(tmp_path):
     rows_per_page = 12_288
-    rows = [page * rows_per_page + 7 for page in range(4)]
+    rows = []
+    for page in range(4):
+        page_begin = page * rows_per_page
+        rows.extend([page_begin + 7, page_begin + 4096 + 11])
     df = cudf.DataFrame(
         {
             "key": range(rows_per_page * 4),

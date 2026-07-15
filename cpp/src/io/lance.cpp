@@ -1518,7 +1518,7 @@ struct selected_miniblock_payload {
 struct selected_miniblock_chunk {
   miniblock_chunk_info chunk;
   std::size_t raw_size{};
-  std::size_t output_offset{};
+  std::size_t chunk_idx{};
 };
 
 struct sparse_miniblock_read {
@@ -2636,7 +2636,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           CUDF_EXPECTS(chunk.buffer_size <=
                          static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
                        "Lance MiniBlock is too large to read");
-          selected_chunks.push_back(selected_miniblock_chunk{chunk, raw_size, output_offset});
+          selected_chunks.push_back(selected_miniblock_chunk{chunk, raw_size, chunk_idx});
           total_miniblock_size += static_cast<std::size_t>(chunk.buffer_size);
         } else {
           auto const payload = read_miniblock_chunk_payload(source, chunk);
@@ -2649,9 +2649,12 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         }
       }
 
-      auto const page_raw_size = static_cast<std::size_t>(page.length) * type_width;
-      page_value_buffers.emplace_back(page_raw_size, stream, mr);
-      auto* page_values = page_value_buffers.back().data();
+      std::uint8_t* page_values = nullptr;
+      if (!use_batched_sparse_headers) {
+        auto const page_raw_size = static_cast<std::size_t>(page.length) * type_width;
+        page_value_buffers.emplace_back(page_raw_size, stream, mr);
+        page_values = page_value_buffers.back().data();
+      }
       auto const num_selected =
         use_batched_sparse_headers ? selected_chunks.size() : selected.size();
 
@@ -2719,13 +2722,30 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       if (use_batched_sparse_headers) {
         for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
           auto const& selected_chunk = selected_chunks[idx];
+          page_value_buffers.emplace_back(selected_chunk.raw_size, stream, mr);
+          auto* chunk_values = page_value_buffers.back().data();
           sparse_miniblock_reads.push_back(
             sparse_miniblock_read{input_data + input_offsets[idx],
-                                  page_values + selected_chunk.output_offset,
+                                  chunk_values,
                                   selected_chunk.raw_size,
                                   selected_chunk.chunk.buffer_size,
                                   page.layout.compression});
+
+          std::vector<size_type> source_rows;
+          std::vector<size_type> target_rows;
+          source_rows.reserve(rows_by_chunk[selected_chunk.chunk_idx].size());
+          target_rows.reserve(rows_by_chunk[selected_chunk.chunk_idx].size());
+          for (auto const& [output_row, row_in_chunk] : rows_by_chunk[selected_chunk.chunk_idx]) {
+            target_rows.push_back(output_row);
+            source_rows.push_back(row_in_chunk);
+          }
+          auto const row_map_idx = source_rows_by_page.size();
+          source_rows_by_page.push_back(std::move(source_rows));
+          target_rows_by_page.push_back(std::move(target_rows));
+          page_copies.push_back(
+            sparse_page_copy{chunk_values, output_data, row_map_idx, type_width});
         }
+        continue;
       } else if (page.layout.compression == compression_type::NONE) {
         for (std::size_t idx = 0; idx < selected.size(); ++idx) {
           CUDF_CUDA_TRY(cudaMemcpyAsync(page_values + selected[idx].output_offset,
