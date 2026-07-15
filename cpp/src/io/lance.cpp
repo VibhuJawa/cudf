@@ -116,6 +116,7 @@ constexpr std::size_t sparse_stack_miniblock_count = 64;
 constexpr std::size_t sparse_page_span_min_pages = 16;
 constexpr std::size_t sparse_page_span_min_chunks_per_page = 2;
 constexpr std::uint64_t sparse_page_span_max_bytes = std::uint64_t{64} << 20;
+constexpr std::uint64_t sparse_page_span_max_overread_ratio = 2;
 constexpr std::size_t sparse_host_staging_min_reads = 32;
 constexpr std::uint64_t sparse_host_staging_max_read_bytes = std::uint64_t{256} << 10;
 constexpr std::uint64_t sparse_host_staging_max_total_bytes = std::uint64_t{64} << 20;
@@ -2985,7 +2986,11 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         span_end   = std::max(span_end, offset + size);
       }
       auto const span_size = span_end - span_begin;
-      if (span_size <= sparse_page_span_max_bytes) {
+      // Avoid trading hundreds of small selected MiniBlock reads for one huge sparse span.
+      if (span_size <= sparse_page_span_max_bytes &&
+          (span_size + sparse_page_span_max_overread_ratio - 1) /
+              sparse_page_span_max_overread_ratio <=
+            selected_data_buffer_size) {
         input_buffers.emplace_back(static_cast<std::size_t>(span_size), stream, mr);
         pending_sparse_device_reads.push_back(
           pending_device_read{span_begin, span_size, input_buffers.back().data()});
