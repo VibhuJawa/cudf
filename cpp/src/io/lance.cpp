@@ -126,6 +126,7 @@ constexpr std::uint64_t sparse_page_span_max_overread_ratio = 2;
 constexpr std::uint64_t sparse_page_selected_span_max_overread_ratio = 4;
 constexpr std::size_t sparse_page_dense_selected_span_min_chunks_per_page = 8;
 constexpr std::uint64_t sparse_page_dense_selected_span_max_overread_ratio = 8;
+constexpr std::size_t sparse_uniform_miniblock_lookup_min_rows = 8;
 constexpr std::size_t sparse_host_staging_min_reads = 32;
 constexpr std::uint64_t sparse_host_staging_max_read_bytes = std::uint64_t{256} << 10;
 constexpr std::uint64_t sparse_host_staging_max_total_bytes = std::uint64_t{64} << 20;
@@ -2493,15 +2494,34 @@ bool have_same_page_rows(lance_column_info const& lhs, lance_column_info const& 
 }
 
 std::size_t find_miniblock_chunk_for_row(std::vector<miniblock_chunk_info> const& chunks,
-                                         size_type row)
+                                         size_type row,
+                                         bool prefer_uniform_stride_lookup = false)
 {
   auto const row_u64 = static_cast<std::uint64_t>(row);
 
-  auto const default_idx = static_cast<std::size_t>(row_u64 >> default_rows_per_miniblock_log);
-  if (default_idx < chunks.size()) {
-    auto const& chunk = chunks[default_idx];
+  if (prefer_uniform_stride_lookup && !chunks.empty()) {
+    auto const chunk_rows = chunks.front().num_rows;
+    auto const chunk_idx =
+      chunk_rows == 0
+        ? chunks.size()
+        : static_cast<std::size_t>(
+            std::has_single_bit(chunk_rows)
+              ? row_u64 >> std::countr_zero(chunk_rows)
+              : row_u64 / chunk_rows);
+    if (chunk_idx < chunks.size()) {
+      auto const& chunk = chunks[chunk_idx];
+      if (row_u64 >= chunk.row_begin && row_u64 < chunk.row_begin + chunk.num_rows) {
+        return chunk_idx;
+      }
+    }
+  }
+
+  auto const lance_default_idx =
+    static_cast<std::size_t>(row_u64 >> default_rows_per_miniblock_log);
+  if (lance_default_idx < chunks.size()) {
+    auto const& chunk = chunks[lance_default_idx];
     if (row_u64 >= chunk.row_begin && row_u64 < chunk.row_begin + chunk.num_rows) {
-      return default_idx;
+      return lance_default_idx;
     }
   }
 
@@ -2656,8 +2676,11 @@ std::unique_ptr<column> read_lance_column(datasource* source,
 
     auto const& chunks       = chunks_by_page[page_idx];
     std::vector<bool> selected_chunks(chunks.size(), false);
+    auto const prefer_uniform_stride_lookup =
+      rows_by_page[page_idx].size() >= sparse_uniform_miniblock_lookup_min_rows;
     for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
-      selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
+      selected_chunks[find_miniblock_chunk_for_row(
+        chunks, row_in_page, prefer_uniform_stride_lookup)] = true;
     }
     for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
       if (selected_chunks[chunk_idx]) { selected_data_buffer_size += chunks[chunk_idx].buffer_size; }
@@ -2712,8 +2735,11 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                  "Lance page is too large to read");
     auto const& chunks = chunks_by_page[page_idx];
     std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_chunk(chunks.size());
+    auto const prefer_uniform_stride_lookup =
+      rows_by_page[page_idx].size() >= sparse_uniform_miniblock_lookup_min_rows;
     for (auto const& [output_row, row_in_page] : rows_by_page[page_idx]) {
-      auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
+      auto const chunk_idx =
+        find_miniblock_chunk_for_row(chunks, row_in_page, prefer_uniform_stride_lookup);
       auto const& chunk    = chunks[chunk_idx];
       auto const row_in_chunk =
         static_cast<size_type>(static_cast<std::uint64_t>(row_in_page) - chunk.row_begin);
@@ -2982,8 +3008,11 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
 
       auto const& chunks       = chunks_by_page[page_idx];
       std::vector<bool> selected_chunks(chunks.size(), false);
+      auto const prefer_uniform_stride_lookup =
+        rows_by_page[page_idx].size() >= sparse_uniform_miniblock_lookup_min_rows;
       for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
-        selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
+        selected_chunks[find_miniblock_chunk_for_row(
+          chunks, row_in_page, prefer_uniform_stride_lookup)] = true;
       }
       auto selected_chunk_count = std::size_t{0};
       selected_miniblock_read_range_count +=
@@ -3010,8 +3039,11 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         chunks_by_page[page_idx] = read_miniblock_chunks(source, column_info.pages[page_idx]);
         auto const& chunks       = chunks_by_page[page_idx];
         std::vector<bool> selected_chunks(chunks.size(), false);
+        auto const prefer_uniform_stride_lookup =
+          rows_by_page[page_idx].size() >= sparse_uniform_miniblock_lookup_min_rows;
         for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
-          selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
+          selected_chunks[find_miniblock_chunk_for_row(
+            chunks, row_in_page, prefer_uniform_stride_lookup)] = true;
         }
         auto selected_chunk_count = std::size_t{0};
         selected_miniblock_read_range_count +=
@@ -3144,8 +3176,11 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         auto const& page   = column_info.pages[page_idx];
         auto const& chunks = chunks_by_page[page_idx];
         std::vector<bool> selected_chunks(chunks.size(), false);
+        auto const prefer_uniform_stride_lookup =
+          rows_by_page[page_idx].size() >= sparse_uniform_miniblock_lookup_min_rows;
         for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
-          selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
+          selected_chunks[find_miniblock_chunk_for_row(
+            chunks, row_in_page, prefer_uniform_stride_lookup)] = true;
         }
 
         auto page_selected_buffer_size = std::uint64_t{0};
@@ -3215,6 +3250,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
                    "Lance page is too large to read");
       auto const& chunks = chunks_by_page[page_idx];
       auto const& page_rows_for_copy = rows_by_page[page_idx];
+      auto const prefer_uniform_stride_lookup =
+        page_rows_for_copy.size() >= sparse_uniform_miniblock_lookup_min_rows;
       auto has_distinct_chunk_rows = use_batched_sparse_headers &&
                                      selected_chunk_counts_by_page[page_idx] ==
                                        page_rows_for_copy.size();
@@ -3243,7 +3280,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           heap_single_rows_by_chunk.resize(chunks.size());
         }
         for (auto const& [output_row, row_in_page] : page_rows_for_copy) {
-          auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
+          auto const chunk_idx =
+            find_miniblock_chunk_for_row(chunks, row_in_page, prefer_uniform_stride_lookup);
           if (chunk_row_counts(chunk_idx) != 0) {
             has_distinct_chunk_rows = false;
             break;
@@ -3260,7 +3298,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         has_single_multi_row_chunk = true;
         for (std::size_t row_idx = 0; row_idx < page_rows_for_copy.size(); ++row_idx) {
           auto const& [output_row, row_in_page] = page_rows_for_copy[row_idx];
-          auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
+          auto const chunk_idx =
+            find_miniblock_chunk_for_row(chunks, row_in_page, prefer_uniform_stride_lookup);
           if (row_idx == 0) {
             single_multi_row_chunk_idx = chunk_idx;
           } else {
@@ -3278,7 +3317,8 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       if (!has_distinct_chunk_rows && !has_single_multi_row_chunk) {
         rows_by_chunk.resize(chunks.size());
         for (auto const& [output_row, row_in_page] : page_rows_for_copy) {
-          auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
+          auto const chunk_idx =
+            find_miniblock_chunk_for_row(chunks, row_in_page, prefer_uniform_stride_lookup);
           auto const& chunk    = chunks[chunk_idx];
           auto const row_in_chunk =
             static_cast<size_type>(static_cast<std::uint64_t>(row_in_page) - chunk.row_begin);
