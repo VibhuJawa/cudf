@@ -51,6 +51,27 @@ void copy_sparse_fixed_width(std::uint8_t const* source,
                              std::size_t type_width,
                              rmm::cuda_stream_view stream);
 
+struct lance_pack_chunk {
+  std::uint8_t const* payload{};
+  std::size_t payload_size{};
+  std::size_t output_offset{};
+};
+
+struct lance_miniblock_header {
+  std::uint32_t num_levels{};
+  std::uint32_t payload_size{};
+};
+
+void pack_lance_miniblocks(lance_pack_chunk const* chunks,
+                           std::size_t num_chunks,
+                           std::uint8_t* output,
+                           rmm::cuda_stream_view stream);
+
+void decode_lance_miniblock_headers(std::uint8_t const* const* headers,
+                                    lance_miniblock_header* decoded,
+                                    std::size_t num_headers,
+                                    rmm::cuda_stream_view stream);
+
 namespace {
 
 constexpr std::size_t lance_buffer_alignment = 64;
@@ -1050,6 +1071,54 @@ rmm::device_uvector<std::uint8_t> read_device_bytes(datasource* source,
   return data;
 }
 
+struct page_data_buffers {
+  std::vector<rmm::device_uvector<std::uint8_t>> storage;
+  std::vector<std::uint8_t const*> pages;
+};
+
+page_data_buffers read_page_data_buffers(datasource* source,
+                                         std::vector<lance_page_info> const& pages,
+                                         rmm::cuda_stream_view stream,
+                                         rmm::device_async_resource_ref mr)
+{
+  page_data_buffers result;
+  result.pages.reserve(pages.size());
+  if (pages.empty()) { return result; }
+
+  std::uint64_t begin = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t end   = 0;
+  std::uint64_t total = 0;
+  for (auto const& page : pages) {
+    auto const offset = page.buffer_offsets[1];
+    auto const size   = page.buffer_sizes[1];
+    CUDF_EXPECTS(offset <= source->size() && size <= source->size() - offset,
+                 "Lance page data range is out of bounds");
+    begin = std::min(begin, offset);
+    end   = std::max(end, offset + size);
+    total += size;
+  }
+
+  auto const span_size = end - begin;
+  auto const max_extra = std::max<std::uint64_t>(1 << 20, total / 8);
+  if (span_size <= total + max_extra) {
+    result.storage.emplace_back(static_cast<std::size_t>(span_size), stream, mr);
+    read_device_bytes_into(source, begin, span_size, result.storage.back().data(), stream);
+    auto const* data = result.storage.back().data();
+    for (auto const& page : pages) {
+      result.pages.push_back(data + static_cast<std::size_t>(page.buffer_offsets[1] - begin));
+    }
+    return result;
+  }
+
+  result.storage.reserve(pages.size());
+  for (auto const& page : pages) {
+    result.storage.push_back(
+      read_device_bytes(source, page.buffer_offsets[1], page.buffer_sizes[1], stream, mr));
+    result.pages.push_back(result.storage.back().data());
+  }
+  return result;
+}
+
 void append_miniblock_metadata(std::vector<std::uint8_t>& metadata,
                                std::uint64_t miniblock_buffer_size,
                                std::uint8_t log_num_values)
@@ -1354,6 +1423,16 @@ struct selected_miniblock_payload {
   std::size_t output_offset{};
 };
 
+struct dense_miniblock_read {
+  miniblock_chunk_info chunk;
+  std::uint8_t const* page_data{};
+  std::uint64_t page_data_size{};
+  std::size_t header_offset{};
+  std::size_t raw_size{};
+  std::size_t output_offset{};
+  compression_type compression{};
+};
+
 void read_dense_pages_values_into(datasource* source,
                                   std::vector<lance_page_info> const& pages,
                                   data_type type,
@@ -1362,23 +1441,23 @@ void read_dense_pages_values_into(datasource* source,
                                   rmm::device_async_resource_ref mr)
 {
   auto const type_width = cudf::size_of(type);
-  std::vector<rmm::device_uvector<std::uint8_t>> page_data_buffers;
-  page_data_buffers.reserve(pages.size());
+  auto page_buffers = read_page_data_buffers(source, pages, stream, mr);
 
   std::vector<device_span<std::uint8_t const>> inputs;
   std::vector<device_span<std::uint8_t>> outputs;
   std::vector<std::size_t> output_sizes;
+  std::vector<dense_miniblock_read> reads;
+  std::vector<std::uint8_t const*> header_ptrs;
   std::size_t total_raw_size = 0;
   std::size_t max_raw_size   = 0;
 
-  for (auto const& page : pages) {
+  for (std::size_t page_idx = 0; page_idx < pages.size(); ++page_idx) {
+    auto const& page = pages[page_idx];
     CUDF_EXPECTS(page.layout.bits_per_value == static_cast<std::uint64_t>(type_width * 8),
                  "Lance page encoding does not match schema type width");
 
     auto const chunks = read_miniblock_chunks(source, page);
-    page_data_buffers.push_back(
-      read_device_bytes(source, page.buffer_offsets[1], page.buffer_sizes[1], stream, mr));
-    auto const* page_data = page_data_buffers.back().data();
+    auto const* page_data = page_buffers.pages[page_idx];
 
     for (auto const& chunk : chunks) {
       CUDF_EXPECTS(chunk.num_rows <=
@@ -1386,36 +1465,66 @@ void read_dense_pages_values_into(datasource* source,
                        type_width,
                    "Lance MiniBlock is too large to read");
       auto const raw_size = static_cast<std::size_t>(chunk.num_rows) * type_width;
-      auto const payload  = read_miniblock_chunk_payload(source, chunk);
-      CUDF_EXPECTS(payload.payload_offset >= page.buffer_offsets[1] &&
-                     payload.payload_size <= page.buffer_sizes[1] &&
-                     payload.payload_offset - page.buffer_offsets[1] <=
-                       page.buffer_sizes[1] - payload.payload_size,
-                   "Lance MiniBlock payload is outside the page data buffer");
-      auto const payload_offset =
-        static_cast<std::size_t>(payload.payload_offset - page.buffer_offsets[1]);
       auto const output_offset =
         static_cast<std::size_t>(page.priority + chunk.row_begin) * type_width;
+      auto const header_offset = chunk.buffer_offset - page.buffer_offsets[1];
+      CUDF_EXPECTS(header_offset <= page.buffer_sizes[1] && chunk.buffer_size <= page.buffer_sizes[1] &&
+                     header_offset <= page.buffer_sizes[1] - chunk.buffer_size,
+                   "Lance MiniBlock is outside the page data buffer");
 
-      if (page.layout.compression == compression_type::NONE) {
-        CUDF_EXPECTS(payload.payload_size == raw_size,
+      header_ptrs.push_back(page_data + static_cast<std::size_t>(header_offset));
+      reads.push_back(dense_miniblock_read{chunk,
+                                           page_data,
+                                           page.buffer_sizes[1],
+                                           static_cast<std::size_t>(header_offset),
+                                           raw_size,
+                                           output_offset,
+                                           page.layout.compression});
+    }
+  }
+
+  if (!reads.empty()) {
+    auto device_header_ptrs = cudf::detail::make_device_uvector(header_ptrs, stream, mr);
+    rmm::device_uvector<lance_miniblock_header> device_headers(reads.size(), stream, mr);
+    decode_lance_miniblock_headers(
+      device_header_ptrs.data(), device_headers.data(), device_headers.size(), stream);
+    auto const headers = cudf::detail::make_host_vector(
+      device_span<lance_miniblock_header const>{device_headers.data(), device_headers.size()},
+      stream);
+
+    for (std::size_t idx = 0; idx < reads.size(); ++idx) {
+      auto const& read   = reads[idx];
+      auto const& header = headers[idx];
+      CUDF_EXPECTS(header.num_levels == 0,
+                   "Lance reader does not yet support repetition/definition levels");
+      auto const payload_size = static_cast<std::size_t>(header.payload_size);
+      auto const expected_chunk_size =
+        miniblock_alignment + payload_size + pad_size(payload_size, miniblock_alignment);
+      CUDF_EXPECTS(expected_chunk_size == read.chunk.buffer_size,
+                   "Invalid Lance MiniBlock payload size");
+      auto const payload_offset = read.header_offset + miniblock_alignment;
+      CUDF_EXPECTS(payload_offset <= read.page_data_size &&
+                     payload_size <= read.page_data_size - payload_offset,
+                   "Lance MiniBlock payload is outside the page data buffer");
+
+      if (read.compression == compression_type::NONE) {
+        CUDF_EXPECTS(payload_size == read.raw_size,
                      "Uncompressed Lance MiniBlock has unexpected payload size");
-        CUDF_CUDA_TRY(cudaMemcpyAsync(output + output_offset,
-                                      page_data + payload_offset,
-                                      raw_size,
+        CUDF_CUDA_TRY(cudaMemcpyAsync(output + read.output_offset,
+                                      read.page_data + payload_offset,
+                                      read.raw_size,
                                       cudaMemcpyDeviceToDevice,
                                       stream.value()));
         continue;
       }
 
-      CUDF_EXPECTS(page.layout.compression == compression_type::ZSTD,
-                   "Unsupported Lance page compression");
-      inputs.push_back(device_span<std::uint8_t const>{
-        page_data + payload_offset, static_cast<std::size_t>(payload.payload_size)});
-      outputs.push_back(device_span<std::uint8_t>{output + output_offset, raw_size});
-      output_sizes.push_back(raw_size);
-      total_raw_size += raw_size;
-      max_raw_size = std::max(max_raw_size, raw_size);
+      CUDF_EXPECTS(read.compression == compression_type::ZSTD, "Unsupported Lance page compression");
+      inputs.push_back(device_span<std::uint8_t const>{read.page_data + payload_offset,
+                                                       payload_size});
+      outputs.push_back(device_span<std::uint8_t>{output + read.output_offset, read.raw_size});
+      output_sizes.push_back(read.raw_size);
+      total_raw_size += read.raw_size;
+      max_raw_size = std::max(max_raw_size, read.raw_size);
     }
   }
 
@@ -1487,8 +1596,8 @@ std::vector<page_metadata> write_column_pages(
   static constexpr auto miniblock_header_size = sizeof(std::uint16_t) + sizeof(std::uint32_t);
   static constexpr auto miniblock_header_pad  = miniblock_alignment - miniblock_header_size;
   static_assert(miniblock_header_size + miniblock_header_pad == miniblock_alignment);
-  std::vector<std::array<std::uint8_t, miniblock_header_size>> miniblock_headers;
-  miniblock_headers.reserve(chunks.size());
+  std::vector<lance_pack_chunk> pack_chunks;
+  pack_chunks.reserve(chunks.size());
   for (std::size_t page_idx = 0; page_idx < pending_pages.size(); ++page_idx) {
     auto const& pending_page      = pending_pages[page_idx];
     auto const miniblock_buf_size = miniblock_buffer_sizes[page_idx];
@@ -1499,30 +1608,23 @@ std::vector<page_metadata> write_column_pages(
     std::size_t page_data_offset = page_data_begin;
     for (std::size_t idx = 0; idx < pending_page.chunk_count; ++idx) {
       auto const& chunk = chunks[pending_page.chunk_begin + idx];
-      miniblock_headers.emplace_back();
-      auto& header = miniblock_headers.back();
-      header[0]    = 0;  // no rep/def levels
-      header[1]    = 0;
-      header[2]    = static_cast<std::uint8_t>(chunk.payload_size & 0xff);
-      header[3]    = static_cast<std::uint8_t>((chunk.payload_size >> 8) & 0xff);
-      header[4]    = static_cast<std::uint8_t>((chunk.payload_size >> 16) & 0xff);
-      header[5]    = static_cast<std::uint8_t>((chunk.payload_size >> 24) & 0xff);
-
-      CUDF_CUDA_TRY(cudaMemcpyAsync(column_data.data() + page_data_offset,
-                                    header.data(),
-                                    header.size(),
-                                    cudaMemcpyHostToDevice,
-                                    stream.value()));
-      page_data_offset += header.size() + miniblock_header_pad;
-      CUDF_CUDA_TRY(cudaMemcpyAsync(column_data.data() + page_data_offset,
-                                    chunk.payload,
-                                    chunk.payload_size,
-                                    cudaMemcpyDeviceToDevice,
-                                    stream.value()));
+      pack_chunks.push_back(lance_pack_chunk{chunk.payload, chunk.payload_size, page_data_offset});
+      page_data_offset += miniblock_header_size + miniblock_header_pad;
       page_data_offset += chunk.payload_size + pad_size(chunk.payload_size, miniblock_alignment);
     }
     CUDF_EXPECTS(page_data_offset == page_data_begin + miniblock_buf_size,
                  "Packed Lance MiniBlock size mismatch");
+  }
+
+  if (!pack_chunks.empty()) {
+    rmm::device_uvector<lance_pack_chunk> device_pack_chunks(pack_chunks.size(), stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_pack_chunks.data(),
+                                  pack_chunks.data(),
+                                  pack_chunks.size() * sizeof(lance_pack_chunk),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    pack_lance_miniblocks(
+      device_pack_chunks.data(), device_pack_chunks.size(), column_data.data(), stream);
   }
 
   write_device_buffer(sink, column_data.data(), column_data.size(), stream);
@@ -1780,6 +1882,50 @@ std::unique_ptr<column> read_lance_column(datasource* source,
 
   auto const type_width = cudf::size_of(field_type);
   auto* output_data = output->mutable_view().head<std::uint8_t>();
+
+  std::uint64_t total_data_buffer_size    = 0;
+  std::uint64_t selected_data_buffer_size = 0;
+  std::vector<std::vector<miniblock_chunk_info>> chunks_by_page(column_info.pages.size());
+  for (auto const& page : column_info.pages) {
+    total_data_buffer_size += page.buffer_sizes[1];
+  }
+  for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
+    if (rows_by_page[page_idx].empty()) { continue; }
+
+    chunks_by_page[page_idx] = read_miniblock_chunks(source, column_info.pages[page_idx]);
+    auto const& chunks       = chunks_by_page[page_idx];
+    std::vector<bool> selected_chunks(chunks.size(), false);
+    for (auto const& [_, row_in_page] : rows_by_page[page_idx]) {
+      selected_chunks[find_miniblock_chunk_for_row(chunks, row_in_page)] = true;
+    }
+    for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+      if (selected_chunks[chunk_idx]) { selected_data_buffer_size += chunks[chunk_idx].buffer_size; }
+    }
+  }
+
+  // Random row selections can touch most MiniBlocks. Once that happens, the coalesced dense path is
+  // cheaper than issuing many small sparse reads and then gathering out of page-sized buffers.
+  if (selected_data_buffer_size >= (total_data_buffer_size + 1) / 2) {
+    std::uint64_t dense_rows = 0;
+    for (auto const& page : column_info.pages) {
+      dense_rows += page.length;
+    }
+
+    auto dense_column = read_lance_column(source, field, column_info, dense_rows, stream, mr);
+    auto source_map   = cudf::detail::make_device_uvector(rows, stream, mr);
+    std::vector<size_type> target_rows(rows.size());
+    std::iota(target_rows.begin(), target_rows.end(), 0);
+    auto target_map = cudf::detail::make_device_uvector(target_rows, stream, mr);
+    copy_sparse_fixed_width(dense_column->view().head<std::uint8_t>(),
+                            output_data,
+                            source_map.data(),
+                            target_map.data(),
+                            static_cast<size_type>(source_map.size()),
+                            type_width,
+                            stream);
+    return output;
+  }
+
   std::vector<rmm::device_uvector<std::uint8_t>> page_value_buffers;
   std::vector<rmm::device_uvector<std::uint8_t>> input_buffers;
   std::vector<std::vector<size_type>> source_rows_by_page;
@@ -1804,7 +1950,7 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                    static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) /
                      type_width,
                  "Lance page is too large to read");
-    auto const chunks = read_miniblock_chunks(source, page);
+    auto const& chunks = chunks_by_page[page_idx];
     std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_chunk(chunks.size());
     for (auto const& [output_row, row_in_page] : rows_by_page[page_idx]) {
       auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
