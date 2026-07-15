@@ -160,8 +160,8 @@ def to_lance(
     optional nvCOMP ZSTD compression.
 
     ``max_rows_per_miniblock`` may be set to a power-of-two value such as
-    512 or 1024 to reduce sparse row lookup read amplification. The default
-    preserves Lance's 4096-row MiniBlock layout.
+    512 or 2048 to tune sparse row lookup read amplification. The default is
+    1024 rows per MiniBlock; set 4096 to use Lance's default layout.
     """
     path_or_buf = ioutils.get_writer_filepath_or_buffer(
         path_or_data=path, mode="wb", storage_options=storage_options

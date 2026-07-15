@@ -110,6 +110,7 @@ constexpr std::uint32_t default_rows_per_page = 64 * 1024;
 constexpr std::uint8_t default_rows_per_page_log = 16;
 constexpr std::uint32_t default_rows_per_miniblock = 4096;
 constexpr std::uint8_t default_rows_per_miniblock_log = 12;
+constexpr std::uint32_t writer_default_rows_per_miniblock = 1024;
 constexpr std::uint32_t max_rows_per_miniblock = std::uint32_t{1} << 15;
 constexpr std::size_t sparse_header_batch_min_reads = 8;
 constexpr std::size_t sparse_multi_column_header_batch_min_reads = 2;
@@ -2131,7 +2132,7 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
   auto const compression  = options.get_compression();
   auto const page_rows_in = options.get_max_rows_per_page().value_or(default_rows_per_page);
   auto const miniblock_rows_in =
-    options.get_max_rows_per_miniblock().value_or(default_rows_per_miniblock);
+    options.get_max_rows_per_miniblock().value_or(writer_default_rows_per_miniblock);
   CUDF_EXPECTS(page_rows_in > 0, "max_rows_per_page must be greater than zero");
 
   std::vector<column_metadata> columns(table.num_columns());

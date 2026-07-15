@@ -194,6 +194,10 @@ class lance_writer_options_builder {
   /**
    * @brief Set the maximum number of rows per Lance MiniBlock.
    *
+   * If unset, the experimental writer uses 1024 rows per MiniBlock to reduce
+   * sparse row lookup read amplification. Set this to 4096 to use Lance's
+   * default MiniBlock row count.
+   *
    * @param rows Maximum rows per MiniBlock
    * @return this for chaining
    */

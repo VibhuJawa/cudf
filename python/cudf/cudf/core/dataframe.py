@@ -7738,7 +7738,8 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
         """Write a DataFrame to a Lance data file using libcudf.
 
         ``max_rows_per_miniblock`` may be set to a power-of-two value such as
-        512 or 1024 to reduce sparse row lookup read amplification.
+        512 or 2048 to tune sparse row lookup read amplification. The default
+        is 1024 rows per MiniBlock.
         """
         from cudf.io import lance
 
