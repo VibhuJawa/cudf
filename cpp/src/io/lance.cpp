@@ -1273,7 +1273,9 @@ void read_device_byte_ranges_into(datasource* source,
     CUDF_EXPECTS(total_read_size <=
                    static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
                  "Lance staged read buffer is too large");
-    std::vector<std::uint8_t> staging(static_cast<std::size_t>(total_read_size));
+    auto staging =
+      cudf::detail::make_pinned_vector<std::uint8_t>(static_cast<std::size_t>(total_read_size),
+                                                     stream);
     std::vector<staged_read_info> staged_reads;
     std::vector<std::future<std::size_t>> futures;
     staged_reads.reserve(non_empty_reads);
@@ -1297,12 +1299,31 @@ void read_device_byte_ranges_into(datasource* source,
                    "Failed to read expected Lance host bytes");
     }
 
-    for (auto const& staged_read : staged_reads) {
-      auto const& read = reads[staged_read.read_idx];
-      CUDF_CUDA_TRY(cudf::detail::memcpy_async(read.output,
-                                               staging.data() + staged_read.staging_offset,
-                                               staged_read.size,
+    for (std::size_t run_begin = 0; run_begin < staged_reads.size();) {
+      auto const& first_staged_read = staged_reads[run_begin];
+      auto const& first_read        = reads[first_staged_read.read_idx];
+      auto const run_staging_begin  = first_staged_read.staging_offset;
+      auto const run_output_begin   = reinterpret_cast<std::uintptr_t>(first_read.output);
+      auto run_size                 = first_staged_read.size;
+      auto run_end                  = run_begin + 1;
+      while (run_end < staged_reads.size()) {
+        auto const& staged_read = staged_reads[run_end];
+        auto const& read        = reads[staged_read.read_idx];
+        auto const output_offset = staged_read.staging_offset - run_staging_begin;
+        CUDF_EXPECTS(run_output_begin <=
+                       std::numeric_limits<std::uintptr_t>::max() - output_offset,
+                     "Lance staged read output range is too large");
+        if (reinterpret_cast<std::uintptr_t>(read.output) != run_output_begin + output_offset) {
+          break;
+        }
+        run_size = staged_read.staging_offset + staged_read.size - run_staging_begin;
+        ++run_end;
+      }
+      CUDF_CUDA_TRY(cudf::detail::memcpy_async(reinterpret_cast<void*>(run_output_begin),
+                                               staging.data() + run_staging_begin,
+                                               run_size,
                                                stream));
+      run_begin = run_end;
     }
     stream.synchronize();
     return;
@@ -3042,6 +3063,16 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       sparse_value_data = page_value_buffers.back().data();
     }
     std::size_t sparse_value_offset = 0;
+    std::uint8_t* sparse_input_data = nullptr;
+    std::size_t sparse_input_offset = 0;
+    if (use_batched_sparse_headers && sparse_page_span_data == nullptr &&
+        selected_data_buffer_size > 0) {
+      CUDF_EXPECTS(selected_data_buffer_size <=
+                     static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
+                   "Lance sparse input buffer is too large");
+      input_buffers.emplace_back(static_cast<std::size_t>(selected_data_buffer_size), stream, mr);
+      sparse_input_data = input_buffers.back().data();
+    }
 
     for (auto page_idx : touched_page_indices) {
       auto const& page = column_info.pages[page_idx];
@@ -3057,6 +3088,10 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       auto has_distinct_chunk_rows = use_batched_sparse_headers &&
                                      selected_chunk_counts_by_page[page_idx] ==
                                        page_rows_for_copy.size();
+      auto has_single_multi_row_chunk = false;
+      std::size_t single_multi_row_chunk_idx = std::numeric_limits<std::size_t>::max();
+      std::array<std::pair<size_type, size_type>, sparse_stack_miniblock_count>
+        stack_multi_rows_in_chunk{};
       std::array<std::uint8_t, sparse_stack_miniblock_count> stack_chunk_row_counts{};
       std::array<std::pair<size_type, size_type>, sparse_stack_miniblock_count>
         stack_single_rows_by_chunk{};
@@ -3090,9 +3125,27 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
           single_rows_by_chunk(chunk_idx) = std::pair{output_row, row_in_chunk};
         }
       }
+      if (!has_distinct_chunk_rows && selected_chunk_counts_by_page[page_idx] == 1 &&
+          page_rows_for_copy.size() <= sparse_stack_miniblock_count) {
+        has_single_multi_row_chunk = true;
+        for (std::size_t row_idx = 0; row_idx < page_rows_for_copy.size(); ++row_idx) {
+          auto const& [output_row, row_in_page] = page_rows_for_copy[row_idx];
+          auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
+          if (row_idx == 0) {
+            single_multi_row_chunk_idx = chunk_idx;
+          } else {
+            CUDF_EXPECTS(chunk_idx == single_multi_row_chunk_idx,
+                         "Lance sparse MiniBlock selection count is inconsistent");
+          }
+          auto const& chunk = chunks[chunk_idx];
+          auto const row_in_chunk =
+            static_cast<size_type>(static_cast<std::uint64_t>(row_in_page) - chunk.row_begin);
+          stack_multi_rows_in_chunk[row_idx] = std::pair{output_row, row_in_chunk};
+        }
+      }
 
       std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_chunk;
-      if (!has_distinct_chunk_rows) {
+      if (!has_distinct_chunk_rows && !has_single_multi_row_chunk) {
         rows_by_chunk.resize(chunks.size());
         for (auto const& [output_row, row_in_page] : page_rows_for_copy) {
           auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
@@ -3113,6 +3166,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       for (std::size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
         auto const chunk_selected =
           has_distinct_chunk_rows ? chunk_row_counts(chunk_idx) != 0
+          : has_single_multi_row_chunk ? chunk_idx == single_multi_row_chunk_idx
                                   : !rows_by_chunk[chunk_idx].empty();
         if (!chunk_selected) { continue; }
         auto const& chunk = chunks[chunk_idx];
@@ -3153,9 +3207,12 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         selected_buffer_size >= ((page.buffer_sizes[1] + 1) / 2) ||
         num_selected == chunks.size();
       std::vector<std::size_t> input_offsets(num_selected);
+      std::uint8_t const* input_data = nullptr;
       if (sparse_page_span_data != nullptr) {
         CUDF_EXPECTS(page.buffer_offsets[1] >= sparse_page_span_begin,
                      "Lance sparse page is before coalesced page span");
+        input_data = sparse_page_span_data +
+                     static_cast<std::size_t>(page.buffer_offsets[1] - sparse_page_span_begin);
         if (use_batched_sparse_headers) {
           for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
             auto const& chunk = selected_chunks[idx].chunk;
@@ -3181,15 +3238,17 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
         }
       } else if (read_full_page) {
         input_buffers.emplace_back(static_cast<std::size_t>(page.buffer_sizes[1]), stream, mr);
+        auto* page_input_data = input_buffers.back().data();
+        input_data            = page_input_data;
         if (!use_batched_sparse_headers && page.layout.compression == compression_type::NONE) {
           read_device_bytes_into(source,
                                  page.buffer_offsets[1],
                                  page.buffer_sizes[1],
-                                 input_buffers.back().data(),
+                                 page_input_data,
                                  stream);
         } else {
           pending_sparse_device_reads.push_back(pending_device_read{
-            page.buffer_offsets[1], page.buffer_sizes[1], input_buffers.back().data()});
+            page.buffer_offsets[1], page.buffer_sizes[1], page_input_data});
         }
         if (use_batched_sparse_headers) {
           for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
@@ -3217,7 +3276,19 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
       } else {
         auto const input_buffer_size =
           use_batched_sparse_headers ? total_miniblock_size : total_payload_size;
-        input_buffers.emplace_back(input_buffer_size, stream, mr);
+        std::uint8_t* page_input_data = nullptr;
+        if (use_batched_sparse_headers && sparse_input_data != nullptr) {
+          CUDF_EXPECTS(input_buffer_size <=
+                         static_cast<std::size_t>(selected_data_buffer_size) -
+                           sparse_input_offset,
+                       "Invalid Lance sparse input buffer offset");
+          page_input_data = sparse_input_data + sparse_input_offset;
+          input_data      = page_input_data;
+        } else {
+          input_buffers.emplace_back(input_buffer_size, stream, mr);
+          page_input_data = input_buffers.back().data();
+          input_data      = page_input_data;
+        }
         std::size_t input_offset = 0;
         if (use_batched_sparse_headers) {
           auto const coalesce_adjacent_miniblock_reads = selected_chunks.size() > 1;
@@ -3240,7 +3311,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
               pending_sparse_device_reads.push_back(pending_device_read{
                 range_offset,
                 range_size,
-                input_buffers.back().data() + input_offsets[range_begin_idx]});
+                page_input_data + input_offsets[range_begin_idx]});
               input_offset += static_cast<std::size_t>(range_size);
             }
           } else {
@@ -3250,7 +3321,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
               pending_sparse_device_reads.push_back(pending_device_read{
                 chunk.buffer_offset,
                 chunk.buffer_size,
-                input_buffers.back().data() + input_offset});
+                page_input_data + input_offset});
               input_offset += static_cast<std::size_t>(chunk.buffer_size);
             }
           }
@@ -3262,23 +3333,21 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
               read_device_bytes_into(source,
                                      payload.payload_offset,
                                      payload.payload_size,
-                                     input_buffers.back().data() + input_offset,
+                                     page_input_data + input_offset,
                                      stream);
             } else {
               pending_sparse_device_reads.push_back(
                 pending_device_read{payload.payload_offset,
                                     payload.payload_size,
-                                    input_buffers.back().data() + input_offset});
+                                    page_input_data + input_offset});
             }
             input_offset += payload.payload_size;
           }
         }
+        if (use_batched_sparse_headers && sparse_input_data != nullptr) {
+          sparse_input_offset += input_buffer_size;
+        }
       }
-      auto const* input_data =
-        sparse_page_span_data == nullptr
-          ? input_buffers.back().data()
-          : sparse_page_span_data +
-              static_cast<std::size_t>(page.buffer_offsets[1] - sparse_page_span_begin);
 
       if (use_batched_sparse_headers) {
         for (std::size_t idx = 0; idx < selected_chunks.size(); ++idx) {
@@ -3300,6 +3369,19 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
               single_rows_by_chunk(selected_chunk.chunk_idx);
             single_row_page_copies.push_back(lance_sparse_copy_row{
               chunk_values, output_data, row_in_chunk, output_row, type_width});
+          } else if (has_single_multi_row_chunk) {
+            auto const row_map_offset = flat_source_rows.size();
+            for (std::size_t row_idx = 0; row_idx < page_rows_for_copy.size(); ++row_idx) {
+              auto const& [output_row, row_in_chunk] = stack_multi_rows_in_chunk[row_idx];
+              flat_target_rows.push_back(output_row);
+              flat_source_rows.push_back(row_in_chunk);
+            }
+            flat_page_copies.push_back(
+              sparse_flat_page_copy{chunk_values,
+                                    output_data,
+                                    row_map_offset,
+                                    static_cast<size_type>(page_rows_for_copy.size()),
+                                    type_width});
           } else {
             auto const& chunk_rows = rows_by_chunk[selected_chunk.chunk_idx];
             auto const row_map_offset = flat_source_rows.size();
