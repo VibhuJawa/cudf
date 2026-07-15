@@ -114,6 +114,22 @@ cdef class LanceWriterOptionsBuilder:
         self.c_obj.max_rows_per_page(rows)
         return self
 
+    cpdef LanceWriterOptionsBuilder max_rows_per_miniblock(self, size_type rows):
+        """
+        Sets the maximum number of rows per Lance MiniBlock.
+
+        Parameters
+        ----------
+        rows : int
+            Maximum rows per MiniBlock.
+
+        Returns
+        -------
+        LanceWriterOptionsBuilder
+        """
+        self.c_obj.max_rows_per_miniblock(rows)
+        return self
+
     cpdef LanceWriterOptions build(self):
         """Build Lance writer options."""
         cdef LanceWriterOptions lance_options = LanceWriterOptions.__new__(

@@ -79,6 +79,29 @@ def test_read_lance_sparse_zstd_many_pages(tmp_path):
     assert_eq(expect, got)
 
 
+def test_read_lance_sparse_zstd_custom_miniblocks(tmp_path):
+    rows_per_page = 8192
+    rows = [7, 1024 + 11, rows_per_page + 13, rows_per_page + 2048 + 17]
+    df = cudf.DataFrame(
+        {
+            "key": range(rows_per_page * 2),
+            "value": [row * 3 for row in range(rows_per_page * 2)],
+        }
+    )
+
+    path = tmp_path / "sparse_zstd_custom_miniblocks.lance"
+    df.to_lance(
+        path,
+        compression="ZSTD",
+        max_rows_per_page=rows_per_page,
+        max_rows_per_miniblock=1024,
+    )
+
+    got = cudf.read_lance(path, columns=["value", "key"], rows=rows)
+    expect = df[["value", "key"]].iloc[rows].reset_index(drop=True)
+    assert_eq(expect, got)
+
+
 def test_read_lance_all_rows(tmp_path):
     df = cudf.DataFrame(
         {
@@ -132,6 +155,17 @@ def test_to_lance_rejects_invalid_page_rows(tmp_path):
 
     with pytest.raises(ValueError, match="max_rows_per_page"):
         df.to_lance(tmp_path / "invalid_page_rows.lance", max_rows_per_page=0)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 3, 32769])
+def test_to_lance_rejects_invalid_miniblock_rows(tmp_path, rows):
+    df = cudf.DataFrame({"key": [1, 2, 3]})
+
+    with pytest.raises(ValueError, match="max_rows_per_miniblock"):
+        df.to_lance(
+            tmp_path / "invalid_miniblock_rows.lance",
+            max_rows_per_miniblock=rows,
+        )
 
 
 def test_read_lance_rejects_invalid_rows(tmp_path):

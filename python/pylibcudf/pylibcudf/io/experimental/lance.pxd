@@ -27,6 +27,7 @@ cdef class LanceWriterOptionsBuilder:
     cpdef LanceWriterOptionsBuilder metadata(self, TableWithMetadata tbl_w_meta)
     cpdef LanceWriterOptionsBuilder compression(self, compression_type compression)
     cpdef LanceWriterOptionsBuilder max_rows_per_page(self, size_type rows)
+    cpdef LanceWriterOptionsBuilder max_rows_per_miniblock(self, size_type rows)
     cpdef LanceWriterOptions build(self)
 
 cpdef void write_lance(LanceWriterOptions options, object stream = *)

@@ -26,6 +26,7 @@ cdef extern from "cudf/io/experimental/lance.hpp" \
         cudf_io_types.compression_type get_compression() \
             except +libcudf_exception_handler
         optional[size_type] get_max_rows_per_page() except +libcudf_exception_handler
+        optional[size_type] get_max_rows_per_miniblock() except +libcudf_exception_handler
 
         @staticmethod
         lance_writer_options_builder builder(
@@ -51,6 +52,9 @@ cdef extern from "cudf/io/experimental/lance.hpp" \
             cudf_io_types.compression_type compression
         ) except +libcudf_exception_handler
         lance_writer_options_builder& max_rows_per_page(
+            size_type rows
+        ) except +libcudf_exception_handler
+        lance_writer_options_builder& max_rows_per_miniblock(
             size_type rows
         ) except +libcudf_exception_handler
 

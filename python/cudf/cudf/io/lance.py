@@ -149,6 +149,7 @@ def to_lance(
     path,
     compression: Literal[False, None, "ZSTD", "NONE", "zstd", "none"] = "ZSTD",
     max_rows_per_page: int | None = None,
+    max_rows_per_miniblock: int | None = None,
     storage_options=None,
     index: bool | None = None,
 ) -> None:
@@ -157,6 +158,10 @@ def to_lance(
     This experimental writer currently supports non-null top-level integer
     and floating-point columns. Page payloads are written by libcudf with
     optional nvCOMP ZSTD compression.
+
+    ``max_rows_per_miniblock`` may be set to a power-of-two value such as
+    512 or 1024 to reduce sparse row lookup read amplification. The default
+    preserves Lance's 4096-row MiniBlock layout.
     """
     path_or_buf = ioutils.get_writer_filepath_or_buffer(
         path_or_data=path, mode="wb", storage_options=storage_options
@@ -166,11 +171,21 @@ def to_lance(
         with path_or_buf as file_obj:
             file_obj = ioutils.get_IOBase_writer(file_obj)
             _plc_write_lance(
-                df, file_obj, compression, max_rows_per_page, index
+                df,
+                file_obj,
+                compression,
+                max_rows_per_page,
+                max_rows_per_miniblock,
+                index,
             )
     else:
         _plc_write_lance(
-            df, path_or_buf, compression, max_rows_per_page, index
+            df,
+            path_or_buf,
+            compression,
+            max_rows_per_page,
+            max_rows_per_miniblock,
+            index,
         )
 
 
@@ -179,6 +194,7 @@ def _plc_write_lance(
     path_or_buf,
     compression: Literal[False, None, "ZSTD", "NONE", "zstd", "none"],
     max_rows_per_page: int | None,
+    max_rows_per_miniblock: int | None,
     index: bool | None,
 ) -> None:
     columns, names = _columns_and_names(table, index)
@@ -191,6 +207,18 @@ def _plc_write_lance(
             or max_rows_per_page <= 0
         ):
             raise ValueError("max_rows_per_page must be a positive integer")
+    if max_rows_per_miniblock is not None:
+        if (
+            isinstance(max_rows_per_miniblock, bool)
+            or not isinstance(max_rows_per_miniblock, int)
+            or max_rows_per_miniblock < 2
+            or max_rows_per_miniblock > 32768
+            or (max_rows_per_miniblock & (max_rows_per_miniblock - 1)) != 0
+        ):
+            raise ValueError(
+                "max_rows_per_miniblock must be a power-of-two integer "
+                "between 2 and 32768"
+            )
 
     with access_columns(*columns, mode="read", scope="internal"):
         plc_table = plc.Table([col.plc_column for col in columns])
@@ -206,5 +234,7 @@ def _plc_write_lance(
         )
         if max_rows_per_page is not None:
             builder.max_rows_per_page(max_rows_per_page)
+        if max_rows_per_miniblock is not None:
+            builder.max_rows_per_miniblock(max_rows_per_miniblock)
 
         plc.io.experimental.write_lance(builder.build())

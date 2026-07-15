@@ -49,6 +49,7 @@ class lance_writer_options {
   table_metadata _metadata;
   compression_type _compression = compression_type::ZSTD;
   std::optional<size_type> _max_rows_per_page{};
+  std::optional<size_type> _max_rows_per_miniblock{};
 
   friend lance_writer_options_builder;
 
@@ -121,6 +122,16 @@ class lance_writer_options {
   {
     return _max_rows_per_page;
   }
+
+  /**
+   * @brief Returns optional maximum rows per Lance MiniBlock.
+   *
+   * @return Optional maximum rows per MiniBlock
+   */
+  [[nodiscard]] std::optional<size_type> get_max_rows_per_miniblock() const noexcept
+  {
+    return _max_rows_per_miniblock;
+  }
 };
 
 /**
@@ -177,6 +188,18 @@ class lance_writer_options_builder {
   lance_writer_options_builder& max_rows_per_page(size_type rows) noexcept
   {
     _options._max_rows_per_page = rows;
+    return *this;
+  }
+
+  /**
+   * @brief Set the maximum number of rows per Lance MiniBlock.
+   *
+   * @param rows Maximum rows per MiniBlock
+   * @return this for chaining
+   */
+  lance_writer_options_builder& max_rows_per_miniblock(size_type rows) noexcept
+  {
+    _options._max_rows_per_miniblock = rows;
     return *this;
   }
 

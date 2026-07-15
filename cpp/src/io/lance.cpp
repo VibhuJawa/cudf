@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -109,6 +110,7 @@ constexpr std::uint32_t default_rows_per_page = 64 * 1024;
 constexpr std::uint8_t default_rows_per_page_log = 16;
 constexpr std::uint32_t default_rows_per_miniblock = 4096;
 constexpr std::uint8_t default_rows_per_miniblock_log = 12;
+constexpr std::uint32_t max_rows_per_miniblock = std::uint32_t{1} << 15;
 constexpr std::size_t sparse_header_batch_min_reads = 8;
 constexpr std::size_t sparse_multi_column_header_batch_min_reads = 2;
 constexpr std::size_t sparse_copy_batch_min_chunks = 2;
@@ -1584,10 +1586,12 @@ struct pending_lance_column {
 void append_page_chunks(std::vector<pending_miniblock_chunk>& chunks,
                         column_view const& column,
                         size_type row_begin,
-                        size_type num_rows)
+                        size_type num_rows,
+                        size_type rows_per_miniblock)
 {
   auto const type_width         = cudf::size_of(column.type());
-  auto const rows_per_miniblock = static_cast<size_type>(default_rows_per_miniblock);
+  auto const miniblock_log      = static_cast<std::uint8_t>(
+    std::bit_width(static_cast<std::uint32_t>(rows_per_miniblock)) - 1);
   chunks.reserve(chunks.size() +
                  static_cast<std::size_t>(
                    (num_rows + rows_per_miniblock - 1) / rows_per_miniblock));
@@ -1605,7 +1609,7 @@ void append_page_chunks(std::vector<pending_miniblock_chunk>& chunks,
 
     pending_miniblock_chunk chunk;
     chunk.num_rows       = rows;
-    chunk.log_num_values = is_last_chunk ? 0 : default_rows_per_miniblock_log;
+    chunk.log_num_values = is_last_chunk ? 0 : miniblock_log;
     chunk.payload        = raw_begin;
     chunk.payload_size   = raw_size;
     chunks.push_back(std::move(chunk));
@@ -2126,6 +2130,8 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
   auto const& table       = options.get_table();
   auto const compression  = options.get_compression();
   auto const page_rows_in = options.get_max_rows_per_page().value_or(default_rows_per_page);
+  auto const miniblock_rows_in =
+    options.get_max_rows_per_miniblock().value_or(default_rows_per_miniblock);
   CUDF_EXPECTS(page_rows_in > 0, "max_rows_per_page must be greater than zero");
 
   std::vector<column_metadata> columns(table.num_columns());
@@ -2138,7 +2144,7 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
     for (size_type row = 0; row < table.num_rows(); row += page_rows_in) {
       auto const rows = std::min(page_rows_in, table.num_rows() - row);
       auto const chunk_begin = pending_column.chunks.size();
-      append_page_chunks(pending_column.chunks, column, row, rows);
+      append_page_chunks(pending_column.chunks, column, row, rows, miniblock_rows_in);
       pending_column.pages.push_back(pending_lance_page{
         row, rows, chunk_begin, pending_column.chunks.size() - chunk_begin});
     }
@@ -2216,6 +2222,18 @@ void validate_options(lance_writer_options const& options)
   CUDF_EXPECTS(options.get_compression() == compression_type::NONE ||
                  options.get_compression() == compression_type::ZSTD,
                "Lance writer currently supports NONE and ZSTD compression");
+  if (options.get_max_rows_per_page().has_value()) {
+    CUDF_EXPECTS(options.get_max_rows_per_page().value() > 0,
+                 "max_rows_per_page must be greater than zero");
+  }
+  if (options.get_max_rows_per_miniblock().has_value()) {
+    auto const rows = options.get_max_rows_per_miniblock().value();
+    CUDF_EXPECTS(rows >= 2, "max_rows_per_miniblock must be at least 2");
+    CUDF_EXPECTS(rows <= static_cast<size_type>(max_rows_per_miniblock),
+                 "max_rows_per_miniblock exceeds Lance MiniBlock metadata limits");
+    CUDF_EXPECTS(std::has_single_bit(static_cast<std::uint32_t>(rows)),
+                 "max_rows_per_miniblock must be a power of two");
+  }
 
   for (size_type idx = 0; idx < table.num_columns(); ++idx) {
     auto const column = table.column(idx);
@@ -2437,8 +2455,7 @@ std::size_t find_miniblock_chunk_for_row(std::vector<miniblock_chunk_info> const
 {
   auto const row_u64 = static_cast<std::uint64_t>(row);
 
-  auto const default_idx =
-    static_cast<std::size_t>(row_u64 >> default_rows_per_miniblock_log);
+  auto const default_idx = static_cast<std::size_t>(row_u64 >> default_rows_per_miniblock_log);
   if (default_idx < chunks.size()) {
     auto const& chunk = chunks[default_idx];
     if (row_u64 >= chunk.row_begin && row_u64 < chunk.row_begin + chunk.num_rows) {

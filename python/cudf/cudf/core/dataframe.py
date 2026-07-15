@@ -7731,10 +7731,15 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
         path,
         compression="ZSTD",
         max_rows_per_page=None,
+        max_rows_per_miniblock=None,
         storage_options=None,
         index=None,
     ):
-        """Write a DataFrame to a Lance data file using libcudf."""
+        """Write a DataFrame to a Lance data file using libcudf.
+
+        ``max_rows_per_miniblock`` may be set to a power-of-two value such as
+        512 or 1024 to reduce sparse row lookup read amplification.
+        """
         from cudf.io import lance
 
         return lance.to_lance(
@@ -7742,6 +7747,7 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
             path=path,
             compression=compression,
             max_rows_per_page=max_rows_per_page,
+            max_rows_per_miniblock=max_rows_per_miniblock,
             storage_options=storage_options,
             index=index,
         )
