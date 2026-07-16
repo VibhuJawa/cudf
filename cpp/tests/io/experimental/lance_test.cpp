@@ -378,12 +378,12 @@ TEST_F(LanceWriterTest, BulkReadsUncompressedImagesDirectlyIntoOutput)
     cudf::io::experimental::lance_bulk_reader_options::builder(cudf::io::source_info{
       cudf::host_span<cudf::host_span<char>>{buffer_spans.data(), buffer_spans.size()}})
       .columns({"image"})
-      .rows({{3, 0, 1}, {2, 1}})
+      .row_locations({{1, 2}, {0, 3}, {1, 1}, {0, 0}, {0, 1}})
       .build();
   auto result = cudf::io::experimental::read_lance_bulk(read_options);
 
   cudf::test::lists_column_wrapper<std::uint8_t> expected{
-    {6, 7, 8, 9}, {1, 2, 3}, {}, {4, 5}, {}};
+    {4, 5}, {6, 7, 8, 9}, {}, {1, 2, 3}, {}};
   cudf::table_view expected_table({expected});
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected_table, result.data.tbl->view());
   EXPECT_EQ(result.metrics.rows_requested, 5);

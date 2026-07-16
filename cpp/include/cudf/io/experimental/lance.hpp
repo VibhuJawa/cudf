@@ -42,8 +42,8 @@ class lance_writer_options_builder;
  * The initial experimental writer emits a self-described Lance v2.2 data file for either non-null
  * top-level fixed-width columns or non-null `LIST<UINT8>` image columns. Fixed-width page payloads
  * use Lance v2.2 MiniBlock chunks with optional ZSTD compression. `LIST<UINT8>` image columns are
- * written as Lance FullZip `large_binary` pages and currently require `compression_type::NONE`, a
- * lookup-oriented profile for already-compressed image bytes.
+ * written as Lance FullZip `large_binary` pages and currently require `compression_type::NONE` so
+ * already-compressed image bytes remain direct-copy payloads.
  */
 class lance_writer_options {
   sink_info _sink;
@@ -411,20 +411,30 @@ struct lance_bulk_read_result {
 };
 
 /**
+ * @brief Identifies a row in one source of a bulk Lance sparse read.
+ */
+struct lance_row_location {
+  size_type source_index{}; ///< Position of the source in `source_info`
+  size_type row_index{};    ///< Row position within that source
+};
+
+/**
  * @brief Settings for `read_lance_bulk()`.
  *
  * This API reads sparse row selections from many Lance sources in one scheduling scope. Rows are
  * emitted in input-source order, and within each source they preserve the order supplied in that
- * source's row-selection vector. It supports the fixed-width MiniBlock columns handled by
- * `read_lance()` and the canonical non-null FullZip `large_binary` image column as a
- * `LIST<UINT8>` output column.
+ * source's row-selection vector. `row_locations` instead preserves the caller's global lookup
+ * order. It supports the fixed-width MiniBlock columns handled by `read_lance()` and the
+ * canonical non-null FullZip `large_binary` image column as a `LIST<UINT8>` output column.
  */
 class lance_bulk_reader_options {
   source_info _source;
   std::vector<std::string> _columns;
   std::vector<std::vector<size_type>> _rows_per_source;
+  std::vector<lance_row_location> _row_locations;
   std::uint64_t _read_coalesce_gap_bytes = 64 * 1024;
   bool _has_row_selection = false;
+  bool _uses_row_locations = false;
 
   friend lance_bulk_reader_options_builder;
 
@@ -474,6 +484,23 @@ class lance_bulk_reader_options {
   {
     return _rows_per_source;
   }
+
+  /**
+   * @brief Returns selected source-row locations in global output order.
+   *
+   * @return Source-row locations
+   */
+  [[nodiscard]] std::vector<lance_row_location> const& get_row_locations() const noexcept
+  {
+    return _row_locations;
+  }
+
+  /**
+   * @brief Returns whether sparse selection was specified as global row locations.
+   *
+   * @return true when row locations are active
+   */
+  [[nodiscard]] bool uses_row_locations() const noexcept { return _uses_row_locations; }
 
   /**
    * @brief Returns maximum byte gap to coalesce between selected sparse value file ranges.
@@ -530,8 +557,25 @@ class lance_bulk_reader_options_builder {
    */
   lance_bulk_reader_options_builder& rows(std::vector<std::vector<size_type>> rows_per_source)
   {
-    _options._rows_per_source   = std::move(rows_per_source);
+    _options._rows_per_source    = std::move(rows_per_source);
+    _options._row_locations.clear();
     _options._has_row_selection = true;
+    _options._uses_row_locations = false;
+    return *this;
+  }
+
+  /**
+   * @brief Select sparse rows as source-row locations in the required output order.
+   *
+   * @param locations Source-row locations, one per output row
+   * @return this for chaining
+   */
+  lance_bulk_reader_options_builder& row_locations(std::vector<lance_row_location> locations)
+  {
+    _options._rows_per_source.clear();
+    _options._row_locations     = std::move(locations);
+    _options._has_row_selection = true;
+    _options._uses_row_locations = true;
     return *this;
   }
 
@@ -561,7 +605,7 @@ class lance_bulk_reader_options_builder {
 /**
  * @brief Read sparse rows from multiple self-described Lance data files into a cuDF table.
  *
- * @param options Options specifying sources, selected columns, and rows per source
+ * @param options Options specifying sources, selected columns, and sparse row selections
  * @param stream CUDA stream used for device memory operations and kernel launches
  * @param mr Device memory resource used to allocate output columns
  * @return Table, metadata, and cold sparse-read diagnostics

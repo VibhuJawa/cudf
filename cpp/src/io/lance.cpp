@@ -4155,7 +4155,7 @@ struct bulk_lance_source_plan {
   lance_file_info file_info;
   std::vector<size_type> columns;
   std::vector<size_type> rows;
-  std::size_t output_row_begin{};
+  std::vector<size_type> output_rows;
 };
 
 struct bulk_miniblock_plan {
@@ -4617,7 +4617,7 @@ lance_bulk_read_result read_lance_bulk_large_binary(
       auto const& page        = column_info.pages[page_idx];
       auto const row_in_page =
         static_cast<size_type>(static_cast<std::uint64_t>(selected_row) - page.priority);
-      auto const output_row = static_cast<size_type>(source_plan.output_row_begin + local_row);
+      auto const output_row = source_plan.output_rows[local_row];
       rows_by_page[page_idx].emplace_back(output_row, row_in_page);
     }
 
@@ -4997,9 +4997,40 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
   CUDF_EXPECTS(options.has_row_selection(),
                "Lance bulk reader currently requires sparse row selections");
   CUDF_EXPECTS(!sources.empty(), "Lance bulk reader requires at least one source");
-  auto const& requested_rows_per_source = options.get_rows_per_source();
-  CUDF_EXPECTS(requested_rows_per_source.size() == sources.size(),
-               "Lance bulk reader requires one row-selection vector per source");
+  auto requested_rows_per_source = options.get_rows_per_source();
+  std::vector<std::vector<size_type>> output_rows_per_source(sources.size());
+  std::size_t total_rows = 0;
+  if (options.uses_row_locations()) {
+    requested_rows_per_source.assign(sources.size(), {});
+    for (auto const& location : options.get_row_locations()) {
+      CUDF_EXPECTS(location.source_index >= 0 &&
+                     static_cast<std::size_t>(location.source_index) < sources.size(),
+                   "Lance bulk row location has an invalid source index");
+      CUDF_EXPECTS(location.row_index >= 0, "Lance bulk row location has a negative row index");
+      auto const source_idx = static_cast<std::size_t>(location.source_index);
+      requested_rows_per_source[source_idx].push_back(location.row_index);
+      CUDF_EXPECTS(total_rows < static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
+                   "Lance bulk row selection contains too many rows for cuDF");
+      output_rows_per_source[source_idx].push_back(static_cast<size_type>(total_rows));
+      ++total_rows;
+    }
+  } else {
+    CUDF_EXPECTS(requested_rows_per_source.size() == sources.size(),
+                 "Lance bulk reader requires one row-selection vector per source");
+    for (std::size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
+      auto const& rows = requested_rows_per_source[source_idx];
+      CUDF_EXPECTS(total_rows <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()) &&
+                     rows.size() <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()) -
+                                      total_rows,
+                   "Lance bulk row selection contains too many rows for cuDF");
+      auto& output_rows = output_rows_per_source[source_idx];
+      output_rows.reserve(rows.size());
+      for (std::size_t local_row = 0; local_row < rows.size(); ++local_row) {
+        output_rows.push_back(static_cast<size_type>(total_rows + local_row));
+      }
+      total_rows += rows.size();
+    }
+  }
 
   std::vector<bulk_lance_source_plan> source_plans;
   source_plans.reserve(sources.size());
@@ -5044,12 +5075,11 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
     };
 
   bool schema_initialized = false;
-  std::size_t total_rows = 0;
   for (std::size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
     if (requested_rows_per_source[source_idx].empty()) {
       num_rows_per_source.push_back(0);
       source_plans.push_back(
-        bulk_lance_source_plan{sources[source_idx].get(), {}, {}, {}, total_rows});
+        bulk_lance_source_plan{sources[source_idx].get(), {}, {}, {}, {}});
       continue;
     }
 
@@ -5075,19 +5105,15 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
     }
 
     auto rows = selected_rows(file_info, requested_rows_per_source[source_idx]);
-    CUDF_EXPECTS(total_rows <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()) &&
-                   rows.size() <=
-                     static_cast<std::size_t>(std::numeric_limits<size_type>::max()) - total_rows,
-                 "Lance bulk row selection contains too many rows for cuDF");
-    auto const output_row_begin = total_rows;
-    total_rows += rows.size();
+    CUDF_EXPECTS(rows.size() == output_rows_per_source[source_idx].size(),
+                 "Lance bulk row selection and output mapping sizes differ");
     num_rows_per_source.push_back(rows.size());
     source_plans.push_back(
       bulk_lance_source_plan{sources[source_idx].get(),
-	                             std::move(file_info),
-	                             std::move(columns),
-	                             std::move(rows),
-	                             output_row_begin});
+                              std::move(file_info),
+                              std::move(columns),
+                              std::move(rows),
+                              std::move(output_rows_per_source[source_idx])});
   }
 
   if (!schema_initialized) {
@@ -5173,8 +5199,7 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
         auto const& page        = pages[page_idx];
         auto const row_in_page =
           static_cast<size_type>(static_cast<std::uint64_t>(selected_row) - page.priority);
-        auto const output_row =
-          static_cast<size_type>(source_plan.output_row_begin + local_row);
+        auto const output_row = source_plan.output_rows[local_row];
         shared_rows_by_page[page_idx].emplace_back(output_row, row_in_page);
       }
     }
@@ -5198,8 +5223,7 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
           auto const& page        = column_info.pages[page_idx];
           auto const row_in_page =
             static_cast<size_type>(static_cast<std::uint64_t>(selected_row) - page.priority);
-          auto const output_row =
-            static_cast<size_type>(source_plan.output_row_begin + local_row);
+          auto const output_row = source_plan.output_rows[local_row];
           rows_by_page[page_idx].emplace_back(output_row, row_in_page);
         }
       }
