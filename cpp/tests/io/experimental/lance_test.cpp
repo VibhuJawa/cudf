@@ -352,6 +352,49 @@ TEST_F(LanceWriterTest, BulkReadsSparseRowsAcrossMultipleSources)
             result.metrics.file_ranges_after_coalescing);
 }
 
+TEST_F(LanceWriterTest, BulkReadsUncompressedImagesDirectlyIntoOutput)
+{
+  cudf::test::lists_column_wrapper<std::uint8_t> images{
+    {1, 2, 3}, {}, {4, 5}, {6, 7, 8, 9}};
+  cudf::table_view table({images});
+  std::vector<std::vector<char>> buffers(2);
+  for (auto& buffer : buffers) {
+    cudf::io::table_metadata metadata;
+    metadata.schema_info.push_back(cudf::io::column_name_info{"image", {}});
+    auto write_options = cudf::io::experimental::lance_writer_options::builder(
+                           cudf::io::sink_info{&buffer}, table)
+                           .metadata(std::move(metadata))
+                           .compression(cudf::io::compression_type::NONE)
+                           .build();
+    cudf::io::experimental::write_lance(write_options);
+  }
+
+  std::vector<cudf::host_span<char>> buffer_spans;
+  buffer_spans.reserve(buffers.size());
+  for (auto& buffer : buffers) {
+    buffer_spans.push_back(cudf::host_span<char>{buffer.data(), buffer.size()});
+  }
+  auto read_options =
+    cudf::io::experimental::lance_bulk_reader_options::builder(cudf::io::source_info{
+      cudf::host_span<cudf::host_span<char>>{buffer_spans.data(), buffer_spans.size()}})
+      .columns({"image"})
+      .rows({{3, 0, 1}, {2, 1}})
+      .build();
+  auto result = cudf::io::experimental::read_lance_bulk(read_options);
+
+  cudf::test::lists_column_wrapper<std::uint8_t> expected{
+    {6, 7, 8, 9}, {1, 2, 3}, {}, {4, 5}, {}};
+  cudf::table_view expected_table({expected});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected_table, result.data.tbl->view());
+  EXPECT_EQ(result.metrics.rows_requested, 5);
+  EXPECT_EQ(result.metrics.requested_output_bytes, 9);
+  EXPECT_EQ(result.metrics.coalesced_file_bytes_read, 9);
+  EXPECT_EQ(result.metrics.file_ranges_before_coalescing, 3);
+  EXPECT_EQ(result.metrics.file_ranges_after_coalescing, 3);
+  EXPECT_EQ(result.metrics.files_touched, 2);
+  EXPECT_EQ(result.metrics.touched_miniblocks, 2);
+}
+
 TEST_F(LanceWriterTest, RejectsUnsupportedCompression)
 {
   cudf::test::fixed_width_column_wrapper<int32_t> col({1, 2, 3});

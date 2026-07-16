@@ -55,12 +55,6 @@ struct lance_fullzip_binary_pack {
   std::size_t output_offset{};
 };
 
-struct lance_binary_copy_span {
-  std::uint8_t const* input{};
-  std::uint8_t* output{};
-  std::size_t size{};
-};
-
 namespace {
 
 __global__ void pack_lance_miniblocks_kernel(lance_pack_chunk const* chunks,
@@ -152,19 +146,6 @@ __global__ void pack_lance_fullzip_binary_kernel(lance_fullzip_binary_pack const
   for (auto idx = static_cast<std::size_t>(threadIdx.x); idx < span.input_size;
        idx += static_cast<std::size_t>(blockDim.x)) {
     payload_output[idx] = span.input[idx];
-  }
-}
-
-__global__ void copy_lance_binary_spans_kernel(lance_binary_copy_span const* spans,
-                                               std::size_t num_spans)
-{
-  auto const span_idx = static_cast<std::size_t>(blockIdx.x);
-  if (span_idx >= num_spans) { return; }
-
-  auto const span = spans[span_idx];
-  for (auto idx = static_cast<std::size_t>(threadIdx.x); idx < span.size;
-       idx += static_cast<std::size_t>(blockDim.x)) {
-    span.output[idx] = span.input[idx];
   }
 }
 
@@ -324,22 +305,6 @@ void pack_lance_fullzip_binary(lance_fullzip_binary_pack const* spans,
                                      block_size,
                                      0,
                                      stream.value()>>>(spans, num_spans, output);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
-}
-
-void copy_lance_binary_spans(lance_binary_copy_span const* spans,
-                             std::size_t num_spans,
-                             rmm::cuda_stream_view stream)
-{
-  if (num_spans == 0) { return; }
-
-  constexpr int block_size = 256;
-  CUDF_EXPECTS(num_spans <= static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
-               "Too many Lance binary spans to copy");
-  copy_lance_binary_spans_kernel<<<static_cast<unsigned int>(num_spans),
-                                   block_size,
-                                   0,
-                                   stream.value()>>>(spans, num_spans);
   CUDF_CUDA_TRY(cudaPeekAtLastError());
 }
 

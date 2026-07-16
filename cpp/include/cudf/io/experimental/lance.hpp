@@ -423,7 +423,7 @@ class lance_bulk_reader_options {
   source_info _source;
   std::vector<std::string> _columns;
   std::vector<std::vector<size_type>> _rows_per_source;
-  std::uint64_t _read_coalesce_gap_bytes = 256 * 1024;
+  std::uint64_t _read_coalesce_gap_bytes = 64 * 1024;
   bool _has_row_selection = false;
 
   friend lance_bulk_reader_options_builder;
