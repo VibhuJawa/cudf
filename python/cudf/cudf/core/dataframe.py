@@ -7726,6 +7726,33 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
             index=index,
         )
 
+    def to_lance(
+        self,
+        path,
+        compression="ZSTD",
+        max_rows_per_page=None,
+        max_rows_per_miniblock=None,
+        storage_options=None,
+        index=None,
+    ):
+        """Write a DataFrame to a Lance data file using libcudf.
+
+        ``max_rows_per_miniblock`` may be set to a power-of-two value such as
+        512 or 2048 to tune sparse row lookup read amplification. The default
+        is 1024 rows per MiniBlock.
+        """
+        from cudf.io import lance
+
+        return lance.to_lance(
+            df=self,
+            path=path,
+            compression=compression,
+            max_rows_per_page=max_rows_per_page,
+            max_rows_per_miniblock=max_rows_per_miniblock,
+            storage_options=storage_options,
+            index=index,
+        )
+
     @_performance_tracking
     def stack(
         self,
