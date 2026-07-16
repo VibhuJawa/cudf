@@ -175,6 +175,41 @@ def test_lance_image_writer_bulk_sparse_read(tmp_path):
     assert_eq(expect, got)
 
 
+def test_lance_mixed_image_and_fixed_width_writer(tmp_path):
+    image = cudf.Series(
+        pa.array(
+            [[1, 2, 3], [], [4, 5, 6, 7], [8, 9, 10, 11, 12]],
+            type=pa.list_(pa.uint8()),
+        )
+    )
+    df = cudf.DataFrame(
+        {
+            "image": image,
+            "image_size_bytes": [3, 0, 4, 5],
+            "width": [100, 200, 300, 400],
+        }
+    )
+
+    path = tmp_path / "mixed_images.lance"
+    df.to_lance(path, compression="NONE", max_rows_per_page=2)
+
+    got_metadata = cudf.read_lance(
+        path, columns=["width", "image_size_bytes"], rows=[3, 1, 0]
+    )
+    expect_metadata = df[["width", "image_size_bytes"]].iloc[[3, 1, 0]].reset_index(
+        drop=True
+    )
+    assert_eq(expect_metadata, got_metadata)
+
+    got_images = cudf.read_lance_bulk(
+        [path], rows_per_source=[[3, 0, 2]], columns=["image"]
+    )
+    expect_images = cudf.DataFrame(
+        {"image": image.iloc[[3, 0, 2]].reset_index(drop=True)}
+    )
+    assert_eq(expect_images, got_images)
+
+
 def test_read_lance_all_rows(tmp_path):
     df = cudf.DataFrame(
         {

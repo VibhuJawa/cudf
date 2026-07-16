@@ -39,11 +39,12 @@ class lance_writer_options_builder;
 /**
  * @brief Settings for `write_lance()`.
  *
- * The initial experimental writer emits a self-described Lance v2.2 data file for either non-null
- * top-level fixed-width columns or non-null `LIST<UINT8>` image columns. Fixed-width page payloads
- * use Lance v2.2 MiniBlock chunks with optional ZSTD compression. `LIST<UINT8>` image columns are
- * written as Lance FullZip `large_binary` pages and currently require `compression_type::NONE` so
- * already-compressed image bytes remain direct-copy payloads.
+ * The initial experimental writer emits a self-described Lance v2.2 data file for non-null
+ * top-level fixed-width columns and non-null `LIST<UINT8>` image columns, including mixed tables.
+ * Fixed-width page payloads use Lance v2.2 MiniBlock chunks with optional ZSTD compression when
+ * the table does not contain images. `LIST<UINT8>` image columns are written as Lance FullZip
+ * `large_binary` pages and require `compression_type::NONE` so already-compressed image bytes
+ * remain direct-copy payloads.
  */
 class lance_writer_options {
   sink_info _sink;

@@ -2343,6 +2343,8 @@ std::vector<column_metadata> write_fullzip_binary_data_pages(
 {
   auto const& table       = options.get_table();
   auto const page_rows_in = options.get_max_rows_per_page().value_or(default_rows_per_page);
+  auto const miniblock_rows_in =
+    options.get_max_rows_per_miniblock().value_or(writer_default_rows_per_miniblock);
   CUDF_EXPECTS(page_rows_in > 0, "max_rows_per_page must be greater than zero");
   CUDF_EXPECTS(table.num_rows() > 0,
                "Lance large-binary writer currently requires at least one row");
@@ -2351,11 +2353,37 @@ std::vector<column_metadata> write_fullzip_binary_data_pages(
   std::vector<std::uint8_t> metadata_section;
   std::vector<column_metadata> columns(table.num_columns());
   std::vector<pending_fullzip_binary_column> pending_columns(table.num_columns());
+  std::vector<pending_lance_column> fixed_columns(table.num_columns());
   std::vector<lance_fullzip_binary_pack> pack_spans;
+  std::vector<lance_pack_chunk> fixed_pack_chunks;
   std::uint64_t data_size = 0;
 
   for (size_type col_idx = 0; col_idx < table.num_columns(); ++col_idx) {
     auto const column = table.column(col_idx);
+    if (column.type().id() != type_id::LIST) {
+      auto& pending_column = fixed_columns[static_cast<std::size_t>(col_idx)];
+      pending_column.type_width = cudf::size_of(column.type());
+
+      for (size_type row = 0; row < table.num_rows(); row += page_rows_in) {
+        auto const rows = std::min(page_rows_in, table.num_rows() - row);
+        auto const chunk_begin = pending_column.chunks.size();
+        append_page_chunks(pending_column.chunks, column, row, rows, miniblock_rows_in);
+        pending_column.pages.push_back(pending_lance_page{
+          row, rows, chunk_begin, pending_column.chunks.size() - chunk_begin});
+      }
+
+      finalize_miniblock_chunks(pending_column.chunks);
+      columns[col_idx].pages = write_column_pages(metadata_section,
+                                                   metadata_begin,
+                                                   pending_column.chunks,
+                                                   pending_column.pages,
+                                                   pending_column.type_width,
+                                                   compression_type::NONE,
+                                                   fixed_pack_chunks,
+                                                   data_size);
+      continue;
+    }
+
     auto const lists  = lists_column_view{column};
     auto const child  = lists.child();
     auto const offsets = copy_list_offsets_to_host(lists, stream);
@@ -2412,11 +2440,19 @@ std::vector<column_metadata> write_fullzip_binary_data_pages(
   write_host_buffer(sink, metadata_section.data(), metadata_section.size());
   auto const data_begin = sink->bytes_written();
   for (size_type col_idx = 0; col_idx < table.num_columns(); ++col_idx) {
-    auto& pending_column = pending_columns[static_cast<std::size_t>(col_idx)];
-    for (auto& page : pending_column.pages) {
-      page.data_offset += data_begin;
+    if (table.column(col_idx).type().id() == type_id::LIST) {
+      auto& pending_column = pending_columns[static_cast<std::size_t>(col_idx)];
+      for (auto& page : pending_column.pages) {
+        page.data_offset += data_begin;
+      }
+      columns[col_idx].pages = make_fullzip_binary_pages(pending_column.pages);
+    } else {
+      for (auto& page : columns[col_idx].pages) {
+        CUDF_EXPECTS(page.buffer_offsets.size() == 2,
+                     "Invalid fixed-width page buffer offsets while writing mixed Lance data");
+        page.buffer_offsets[1] += data_begin;
+      }
     }
-    columns[col_idx].pages = make_fullzip_binary_pages(pending_column.pages);
   }
 
   rmm::device_uvector<std::uint8_t> data(static_cast<std::size_t>(data_size), stream);
@@ -2432,6 +2468,15 @@ std::vector<column_metadata> write_fullzip_binary_data_pages(
                                   stream.value()));
     pack_lance_fullzip_binary(
       device_pack_spans.data(), device_pack_spans.size(), data.data(), stream);
+  }
+  if (!fixed_pack_chunks.empty()) {
+    rmm::device_uvector<lance_pack_chunk> device_pack_chunks(fixed_pack_chunks.size(), stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_pack_chunks.data(),
+                                  fixed_pack_chunks.data(),
+                                  fixed_pack_chunks.size() * sizeof(lance_pack_chunk),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    pack_lance_miniblocks(device_pack_chunks.data(), device_pack_chunks.size(), data.data(), stream);
   }
   write_device_buffer(sink, data.data(), data.size(), stream);
 
@@ -2497,8 +2542,6 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
       return column.type().id() == type_id::LIST;
     });
   if (binary_columns > 0) {
-    CUDF_EXPECTS(binary_columns == table.num_columns(),
-                 "Lance large-binary writer cannot mix image and fixed-width columns yet");
     CUDF_EXPECTS(compression == compression_type::NONE,
                  "Lance large-binary writer currently requires NONE compression");
     return write_fullzip_binary_data_pages(sink, options, stream);

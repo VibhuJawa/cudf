@@ -59,7 +59,6 @@ def _validate_lance_columns(columns, names):
     if not columns:
         raise ValueError("Lance writer requires at least one column")
 
-    image_columns = []
     for name, col in zip(names, columns, strict=True):
         is_image_column = (
             isinstance(col.dtype, ListDtype)
@@ -77,12 +76,6 @@ def _validate_lance_columns(columns, names):
                 "Lance writer currently supports only non-null columns; "
                 f"column {name!r} contains null values"
             )
-        image_columns.append(is_image_column)
-
-    if any(image_columns) and not all(image_columns):
-        raise NotImplementedError(
-            "Lance writer cannot mix fixed-width columns and list<uint8> image columns"
-        )
 
 
 def _normalize_lance_read_columns(columns):
@@ -284,11 +277,12 @@ def to_lance(
 ) -> None:
     """Write a DataFrame to a Lance data file using libcudf.
 
-    This experimental writer currently supports either non-null top-level
-    integer/floating-point columns or non-null ``list<uint8>`` image columns.
-    Fixed-width page payloads are written with optional nvCOMP ZSTD
-    compression. Image columns are written as Lance ``large_binary`` pages
-    and currently require ``compression="NONE"``.
+    This experimental writer supports non-null top-level integer/floating-point
+    columns and non-null ``list<uint8>`` image columns, including mixed image
+    and fixed-width tables. Fixed-width-only tables support optional nvCOMP
+    ZSTD compression. Tables containing image columns are written with
+    ``compression="NONE"`` because their payloads are commonly already
+    compressed JPEG or PNG bytes.
 
     ``max_rows_per_miniblock`` may be set to a power-of-two value such as
     512 or 2048 to tune sparse row lookup read amplification. The default is
