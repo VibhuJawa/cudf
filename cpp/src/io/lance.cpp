@@ -5,6 +5,7 @@
 
 #include "io/comp/compression.hpp"
 #include "io/comp/nvcomp_adapter.hpp"
+#include "io/utilities/datasource_batch.hpp"
 #include "io/utilities/hostdevice_vector.hpp"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -4301,6 +4302,8 @@ void read_device_byte_ranges_into(std::vector<std::unique_ptr<datasource>> const
 {
   std::vector<std::future<std::size_t>> futures;
   std::vector<std::size_t> expected_sizes;
+  std::vector<std::vector<cudf::io::detail::datasource_device_read_request>> requests_by_source(
+    sources.size());
   futures.reserve(reads.size());
   expected_sizes.reserve(reads.size());
 
@@ -4318,10 +4321,37 @@ void read_device_byte_ranges_into(std::vector<std::unique_ptr<datasource>> const
     auto const offset_bytes = static_cast<std::size_t>(read.offset);
     auto const size_bytes   = static_cast<std::size_t>(read.size);
     if (source->is_device_read_preferred(size_bytes)) {
-      futures.push_back(source->device_read_async(offset_bytes, size_bytes, read.output, stream));
-      expected_sizes.push_back(size_bytes);
+      requests_by_source[read.source_idx].push_back(
+        cudf::io::detail::datasource_device_read_request{offset_bytes, size_bytes, read.output});
     } else {
       read_device_bytes_into(source, read.offset, read.size, read.output, stream);
+    }
+  }
+
+  auto has_device_reads = false;
+  for (auto& requests : requests_by_source) {
+    if (requests.empty()) { continue; }
+    has_device_reads = true;
+    std::sort(requests.begin(), requests.end(), [](auto const& lhs, auto const& rhs) {
+      return lhs.offset < rhs.offset;
+    });
+  }
+  if (has_device_reads) { stream.synchronize(); }
+
+  for (std::size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
+    auto const& requests = requests_by_source[source_idx];
+    if (requests.empty()) { continue; }
+    auto source_futures = cudf::io::detail::device_read_async_batch(
+      *sources[source_idx],
+      host_span<cudf::io::detail::datasource_device_read_request const>{requests.data(),
+                                                                       requests.size()},
+      stream,
+      true);
+    CUDF_EXPECTS(source_futures.size() == requests.size(),
+                 "Lance device read batch returned an unexpected number of futures");
+    for (std::size_t request_idx = 0; request_idx < requests.size(); ++request_idx) {
+      futures.push_back(std::move(source_futures[request_idx]));
+      expected_sizes.push_back(requests[request_idx].size);
     }
   }
 

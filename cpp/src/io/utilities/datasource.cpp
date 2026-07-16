@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "io/utilities/datasource_batch.hpp"
+
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/getenv_or.hpp>
 #include <cudf/detail/utilities/host_worker_pool.hpp>
@@ -164,6 +166,27 @@ class file_source : public kvikio_source<kvikio::FileHandle> {
                                 kvikio::defaults::task_size(),
                                 kvikio::defaults::gds_threshold(),
                                 false /* not to sync_default_stream */);
+  }
+
+  std::vector<std::future<size_t>> device_read_async_batch(
+    host_span<detail::datasource_device_read_request const> requests,
+    rmm::cuda_stream_view stream,
+    bool stream_is_ready)
+  {
+    CUDF_EXPECTS(supports_device_read(), "Device reads are not supported for this file.");
+    if (!stream_is_ready) { stream.synchronize(); }
+    std::vector<std::future<size_t>> futures;
+    futures.reserve(requests.size());
+    for (auto const& request : requests) {
+      auto const read_size = std::min(request.size, this->size() - request.offset);
+      futures.push_back(_kvikio_handle.pread(request.dst,
+                                             read_size,
+                                             request.offset,
+                                             kvikio::defaults::task_size(),
+                                             kvikio::defaults::gds_threshold(),
+                                             false /* not to sync_default_stream */));
+    }
+    return futures;
   }
 };
 
@@ -413,6 +436,24 @@ class remote_file_source : public file_source {
 };
 #endif
 }  // namespace
+
+std::vector<std::future<std::size_t>> detail::device_read_async_batch(
+  datasource& source,
+  host_span<datasource_device_read_request const> requests,
+  rmm::cuda_stream_view stream,
+  bool stream_is_ready)
+{
+  if (auto* file = dynamic_cast<file_source*>(&source); file != nullptr) {
+    return file->device_read_async_batch(requests, stream, stream_is_ready);
+  }
+
+  std::vector<std::future<std::size_t>> futures;
+  futures.reserve(requests.size());
+  for (auto const& request : requests) {
+    futures.push_back(source.device_read_async(request.offset, request.size, request.dst, stream));
+  }
+  return futures;
+}
 
 std::unique_ptr<datasource> datasource::create(std::string const& filepath,
                                                size_t offset,
