@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import pyarrow as pa
 
 import cudf
 from cudf.testing import assert_eq
@@ -99,6 +100,49 @@ def test_read_lance_sparse_zstd_custom_miniblocks(tmp_path):
 
     got = cudf.read_lance(path, columns=["value", "key"], rows=rows)
     expect = df[["value", "key"]].iloc[rows].reset_index(drop=True)
+    assert_eq(expect, got)
+
+
+def test_read_lance_bulk_sparse_rows(tmp_path):
+    paths = []
+    rows_per_source = [[0, 3, 7], [2, 1]]
+    for source_idx in range(2):
+        df = cudf.DataFrame(
+            {
+                "key": [source_idx * 100 + row for row in range(8)],
+                "value": [source_idx * 1000 + row * 2 for row in range(8)],
+            }
+        )
+        path = tmp_path / f"bulk_{source_idx}.lance"
+        df.to_lance(path, compression="ZSTD", max_rows_per_page=8)
+        paths.append(path)
+
+    got = cudf.read_lance_bulk(
+        paths, rows_per_source=rows_per_source, columns=["value", "key"]
+    )
+    expect = cudf.DataFrame(
+        {
+            "value": [0, 6, 14, 1004, 1002],
+            "key": [0, 3, 7, 102, 101],
+        }
+    )
+    assert_eq(expect, got)
+
+
+def test_lance_image_writer_bulk_sparse_read(tmp_path):
+    image = cudf.Series(
+        pa.array(
+            [[1, 2, 3], [], [4, 5, 6, 7], [8, 9, 10, 11, 12]],
+            type=pa.list_(pa.uint8()),
+        )
+    )
+    df = cudf.DataFrame({"image": image})
+
+    path = tmp_path / "images.lance"
+    df.to_lance(path, compression="NONE")
+
+    got = cudf.read_lance_bulk([path], rows_per_source=[[3, 0, 1, 2]], columns=["image"])
+    expect = cudf.DataFrame({"image": image.iloc[[3, 0, 1, 2]].reset_index(drop=True)})
     assert_eq(expect, got)
 
 

@@ -105,6 +105,22 @@ def _normalize_lance_rows(rows):
     return row_ids
 
 
+def _normalize_lance_rows_per_source(rows_per_source):
+    if rows_per_source is None:
+        raise TypeError("rows_per_source is required")
+    if isinstance(rows_per_source, (str, bytes)):
+        raise TypeError("rows_per_source must be a sequence of row-id sequences")
+
+    try:
+        iterator = iter(rows_per_source)
+    except TypeError as exc:
+        raise TypeError(
+            "rows_per_source must be a sequence of row-id sequences"
+        ) from exc
+
+    return [_normalize_lance_rows(rows) for rows in iterator]
+
+
 def read_lance(
     filepath_or_buffer,
     columns=None,
@@ -144,6 +160,55 @@ def read_lance(
     )
 
 
+def read_lance_bulk(
+    filepath_or_buffer,
+    rows_per_source,
+    columns=None,
+    storage_options=None,
+    bytes_per_thread=None,
+    read_coalesce_gap_bytes: int | None = None,
+) -> DataFrame:
+    """Read sparse rows from multiple Lance data files using libcudf.
+
+    This experimental reader batches a sparse lookup across many Lance files.
+    Rows are emitted in source order, and within each source they preserve the
+    order supplied in ``rows_per_source``. It supports the fixed-width columns
+    handled by :func:`read_lance` and the canonical non-null ``large_binary``
+    ``image`` column as a ``list<uint8>`` cuDF column.
+    """
+    path_or_buf = ioutils.get_reader_filepath_or_buffer(
+        path_or_data=filepath_or_buffer,
+        iotypes=(BytesIO,),
+        storage_options=storage_options,
+        bytes_per_thread=bytes_per_thread,
+    )
+    if isinstance(path_or_buf, (str, bytes, BytesIO)):
+        raise TypeError("read_lance_bulk requires a sequence of sources")
+    sources = list(path_or_buf)
+    rows = _normalize_lance_rows_per_source(rows_per_source)
+    if len(rows) != len(sources):
+        raise ValueError("rows_per_source must contain one row list per source")
+
+    column_names = _normalize_lance_read_columns(columns)
+    builder = plc.io.experimental.LanceBulkReaderOptions.builder(
+        plc.io.SourceInfo(sources)
+    ).rows(rows)
+    if column_names is not None:
+        builder.columns(column_names)
+    if read_coalesce_gap_bytes is not None:
+        if (
+            isinstance(read_coalesce_gap_bytes, bool)
+            or not isinstance(read_coalesce_gap_bytes, int)
+            or read_coalesce_gap_bytes < 0
+        ):
+            raise ValueError("read_coalesce_gap_bytes must be a non-negative integer")
+        builder.read_coalesce_gap_bytes(read_coalesce_gap_bytes)
+
+    return DataFrame.from_pylibcudf(
+        plc.io.experimental.read_lance_bulk(builder.build())
+    )
+
+
 def to_lance(
     df: DataFrame,
     path,
@@ -155,9 +220,11 @@ def to_lance(
 ) -> None:
     """Write a DataFrame to a Lance data file using libcudf.
 
-    This experimental writer currently supports non-null top-level integer
-    and floating-point columns. Page payloads are written by libcudf with
-    optional nvCOMP ZSTD compression.
+    This experimental writer currently supports either non-null top-level
+    integer/floating-point columns or non-null ``list<uint8>`` image columns.
+    Fixed-width page payloads are written with optional nvCOMP ZSTD
+    compression. Image columns are written as Lance ``large_binary`` pages
+    and currently require ``compression="NONE"``.
 
     ``max_rows_per_miniblock`` may be set to a power-of-two value such as
     512 or 2048 to tune sparse row lookup read amplification. The default is

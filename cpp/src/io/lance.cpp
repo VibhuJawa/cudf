@@ -15,6 +15,7 @@
 #include <cudf/io/data_sink.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/lance.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -84,6 +85,23 @@ struct lance_sparse_copy_row {
   std::size_t type_width{};
 };
 
+struct lance_fullzip_binary_prefix {
+  std::uint8_t const* input{};
+  std::size_t prefix_size{};
+};
+
+struct lance_fullzip_binary_pack {
+  std::uint8_t const* input{};
+  std::size_t input_size{};
+  std::size_t output_offset{};
+};
+
+struct lance_binary_copy_span {
+  std::uint8_t const* input{};
+  std::uint8_t* output{};
+  std::size_t size{};
+};
+
 void pack_lance_miniblocks(lance_pack_chunk const* chunks,
                            std::size_t num_chunks,
                            std::uint8_t* output,
@@ -102,6 +120,20 @@ void copy_sparse_fixed_width_batch(lance_sparse_copy_chunk const* chunks,
 void copy_sparse_fixed_width_single_row_batch(lance_sparse_copy_row const* rows,
                                               std::size_t num_rows,
                                               rmm::cuda_stream_view stream);
+
+void decode_lance_fullzip_binary_prefixes(lance_fullzip_binary_prefix const* prefixes,
+                                          std::uint64_t* decoded,
+                                          std::size_t num_prefixes,
+                                          rmm::cuda_stream_view stream);
+
+void pack_lance_fullzip_binary(lance_fullzip_binary_pack const* spans,
+                               std::size_t num_spans,
+                               std::uint8_t* output,
+                               rmm::cuda_stream_view stream);
+
+void copy_lance_binary_spans(lance_binary_copy_span const* spans,
+                             std::size_t num_spans,
+                             rmm::cuda_stream_view stream);
 
 namespace {
 
@@ -134,6 +166,9 @@ constexpr std::size_t miniblock_alignment = 8;
 constexpr std::array<std::uint8_t, 4> lance_magic{'L', 'A', 'N', 'C'};
 
 enum class wire_type : std::uint8_t { varint = 0, fixed64 = 1, length_delimited = 2, fixed32 = 5 };
+
+enum class lance_logical_kind : std::uint8_t { FIXED_WIDTH, LARGE_BINARY };
+enum class lance_page_layout_kind : std::uint8_t { MINIBLOCK, FULL_ZIP };
 
 std::size_t count_selected_miniblock_read_ranges(std::vector<bool> const& selected_chunks,
                                                  bool coalesce_adjacent)
@@ -285,6 +320,16 @@ std::vector<std::uint8_t> make_zstd_general_encoding(std::uint64_t bits_per_valu
   return encoding.release();
 }
 
+std::vector<std::uint8_t> make_variable_encoding(std::uint64_t bits_per_offset)
+{
+  proto_writer variable;
+  variable.message_field(1, make_flat_encoding(bits_per_offset));
+
+  proto_writer encoding;
+  encoding.message_field(2, variable.buffer());
+  return encoding.release();
+}
+
 std::vector<std::uint8_t> make_miniblock_page_layout(std::uint64_t bits_per_value,
                                                      std::uint64_t num_items,
                                                      compression_type compression)
@@ -300,6 +345,19 @@ std::vector<std::uint8_t> make_miniblock_page_layout(std::uint64_t bits_per_valu
 
   proto_writer page_layout;
   page_layout.message_field(1, miniblock.buffer());
+  return page_layout.release();
+}
+
+std::vector<std::uint8_t> make_fullzip_binary_page_layout(std::uint64_t num_items)
+{
+  proto_writer fullzip;
+  fullzip.uint_field(4, 64);         // bits_per_offset
+  fullzip.uint_field(5, num_items);  // num_items
+  fullzip.uint_field(6, num_items);  // num_visible_items
+  fullzip.message_field(7, make_variable_encoding(64));
+
+  proto_writer page_layout;
+  page_layout.message_field(3, fullzip.buffer());
   return page_layout.release();
 }
 
@@ -320,6 +378,12 @@ std::vector<std::uint8_t> make_page_encoding(std::uint64_t bits_per_value,
   return make_direct_encoding(make_any("/lance.encodings21.PageLayout",
                                        make_miniblock_page_layout(
                                          bits_per_value, num_items, compression)));
+}
+
+std::vector<std::uint8_t> make_fullzip_binary_page_encoding(std::uint64_t num_items)
+{
+  return make_direct_encoding(
+    make_any("/lance.encodings21.PageLayout", make_fullzip_binary_page_layout(num_items)));
 }
 
 std::vector<std::uint8_t> make_column_encoding()
@@ -343,6 +407,7 @@ std::string logical_type(data_type type)
     case type_id::UINT64: return "uint64";
     case type_id::FLOAT32: return "float";
     case type_id::FLOAT64: return "double";
+    case type_id::LIST: return "large_binary";
     default: CUDF_FAIL("Unsupported Lance writer type: " + cudf::type_to_name(type));
   }
 }
@@ -359,6 +424,7 @@ std::optional<data_type> data_type_from_lance_logical_type(std::string const& lo
   if (logical_type == "uint64") { return data_type{type_id::UINT64}; }
   if (logical_type == "float") { return data_type{type_id::FLOAT32}; }
   if (logical_type == "double") { return data_type{type_id::FLOAT64}; }
+  if (logical_type == "large_binary") { return data_type{type_id::LIST}; }
   return std::nullopt;
 }
 
@@ -374,7 +440,8 @@ bool is_supported_lance_type(data_type type)
     case type_id::UINT32:
     case type_id::UINT64:
     case type_id::FLOAT32:
-    case type_id::FLOAT64: return true;
+    case type_id::FLOAT64:
+    case type_id::LIST: return true;
     default: return false;
   }
 }
@@ -520,21 +587,28 @@ class proto_reader {
 struct lance_field_info {
   std::string name;
   std::optional<data_type> type;
+  lance_logical_kind kind = lance_logical_kind::FIXED_WIDTH;
   bool nullable{};
   std::string logical_type;
   std::string unsupported_reason;
 
   [[nodiscard]] bool is_supported() const noexcept
   {
-    return type.has_value() && unsupported_reason.empty();
+    return unsupported_reason.empty() &&
+           (kind == lance_logical_kind::LARGE_BINARY || type.has_value());
   }
 };
 
 struct lance_page_layout {
+  lance_page_layout_kind kind = lance_page_layout_kind::MINIBLOCK;
   compression_type compression = compression_type::NONE;
   std::uint64_t bits_per_value{};
+  std::uint64_t bits_per_offset{};
   std::uint64_t num_items{};
+  std::uint64_t num_visible_items{};
   std::uint64_t num_buffers{};
+  std::uint32_t bits_rep{};
+  std::uint32_t bits_def{};
   bool has_large_chunk{};
 };
 
@@ -605,6 +679,13 @@ void write_device_buffer(data_sink* sink,
 void write_little_endian_u32(std::vector<std::uint8_t>& buffer, std::uint32_t value)
 {
   for (int i = 0; i < 4; ++i) {
+    buffer.push_back(static_cast<std::uint8_t>((value >> (i * 8)) & 0xff));
+  }
+}
+
+void write_little_endian_u64(std::vector<std::uint8_t>& buffer, std::uint64_t value)
+{
+  for (int i = 0; i < 8; ++i) {
     buffer.push_back(static_cast<std::uint8_t>((value >> (i * 8)) & 0xff));
   }
 }
@@ -752,8 +833,9 @@ lance_page_layout parse_general_encoding(proto_reader reader)
         break;
       case 3: {
         expect_wire_type(type, wire_type::length_delimited, "General.values");
-        auto inner          = parse_compressive_encoding(reader.read_message());
-        layout.bits_per_value = inner.bits_per_value;
+        auto inner             = parse_compressive_encoding(reader.read_message());
+        layout.bits_per_value  = inner.bits_per_value;
+        layout.bits_per_offset = inner.bits_per_offset;
         break;
       }
       default: reader.skip(type); break;
@@ -761,7 +843,32 @@ lance_page_layout parse_general_encoding(proto_reader reader)
   }
   CUDF_EXPECTS(layout.compression == compression_type::ZSTD,
                "Lance general encoding must specify ZSTD compression");
-  CUDF_EXPECTS(layout.bits_per_value > 0, "Lance general encoding is missing inner flat encoding");
+  CUDF_EXPECTS(layout.bits_per_value > 0 || layout.bits_per_offset > 0,
+               "Lance general encoding is missing inner value encoding");
+  return layout;
+}
+
+lance_page_layout parse_variable_encoding(proto_reader reader)
+{
+  lance_page_layout layout;
+  int field{};
+  wire_type type{};
+  while (reader.next(field, type)) {
+    switch (field) {
+      case 1: {
+        expect_wire_type(type, wire_type::length_delimited, "Variable.offsets");
+        auto offsets            = parse_compressive_encoding(reader.read_message());
+        layout.bits_per_offset  = offsets.bits_per_value;
+        break;
+      }
+      case 2:
+        expect_wire_type(type, wire_type::length_delimited, "Variable.values");
+        layout.compression = parse_buffer_compression(reader.read_message());
+        break;
+      default: reader.skip(type); break;
+    }
+  }
+  CUDF_EXPECTS(layout.bits_per_offset > 0, "Lance variable encoding is missing offsets");
   return layout;
 }
 
@@ -777,23 +884,33 @@ lance_page_layout parse_compressive_encoding(proto_reader reader)
         layout.bits_per_value = parse_flat_bits(reader.read_message());
         layout.compression    = compression_type::NONE;
         break;
+      case 2: {
+        expect_wire_type(type, wire_type::length_delimited, "CompressiveEncoding.variable");
+        auto variable          = parse_variable_encoding(reader.read_message());
+        layout.bits_per_offset = variable.bits_per_offset;
+        layout.compression     = variable.compression;
+        break;
+      }
       case 10: {
         expect_wire_type(type, wire_type::length_delimited, "CompressiveEncoding.general");
-        auto general          = parse_general_encoding(reader.read_message());
-        layout.bits_per_value = general.bits_per_value;
-        layout.compression    = general.compression;
+        auto general           = parse_general_encoding(reader.read_message());
+        layout.bits_per_value  = general.bits_per_value;
+        layout.bits_per_offset = general.bits_per_offset;
+        layout.compression     = general.compression;
         break;
       }
       default: reader.skip(type); break;
     }
   }
-  CUDF_EXPECTS(layout.bits_per_value > 0, "Unsupported Lance compressive encoding");
+  CUDF_EXPECTS(layout.bits_per_value > 0 || layout.bits_per_offset > 0,
+               "Unsupported Lance compressive encoding");
   return layout;
 }
 
 lance_page_layout parse_miniblock_layout(proto_reader reader)
 {
   lance_page_layout layout;
+  layout.kind = lance_page_layout_kind::MINIBLOCK;
   int field{};
   wire_type type{};
   while (reader.next(field, type)) {
@@ -826,20 +943,79 @@ lance_page_layout parse_miniblock_layout(proto_reader reader)
   return layout;
 }
 
-lance_page_layout parse_page_layout(proto_reader reader)
+lance_page_layout parse_fullzip_layout(proto_reader reader)
 {
   lance_page_layout layout;
+  layout.kind = lance_page_layout_kind::FULL_ZIP;
   int field{};
   wire_type type{};
   while (reader.next(field, type)) {
-    if (field == 1) {
-      expect_wire_type(type, wire_type::length_delimited, "PageLayout.mini_block_layout");
-      layout = parse_miniblock_layout(reader.read_message());
-    } else {
-      reader.skip(type);
+    switch (field) {
+      case 1:
+        expect_wire_type(type, wire_type::varint, "FullZipLayout.bits_rep");
+        layout.bits_rep = static_cast<std::uint32_t>(reader.read_varint());
+        break;
+      case 2:
+        expect_wire_type(type, wire_type::varint, "FullZipLayout.bits_def");
+        layout.bits_def = static_cast<std::uint32_t>(reader.read_varint());
+        break;
+      case 3:
+        expect_wire_type(type, wire_type::varint, "FullZipLayout.bits_per_value");
+        layout.bits_per_value = reader.read_varint();
+        break;
+      case 4:
+        expect_wire_type(type, wire_type::varint, "FullZipLayout.bits_per_offset");
+        layout.bits_per_offset = reader.read_varint();
+        break;
+      case 5:
+        expect_wire_type(type, wire_type::varint, "FullZipLayout.num_items");
+        layout.num_items = reader.read_varint();
+        break;
+      case 6:
+        expect_wire_type(type, wire_type::varint, "FullZipLayout.num_visible_items");
+        layout.num_visible_items = reader.read_varint();
+        break;
+      case 7: {
+        expect_wire_type(type, wire_type::length_delimited, "FullZipLayout.value_compression");
+        auto value_layout = parse_compressive_encoding(reader.read_message());
+        layout.compression = value_layout.compression;
+        if (layout.bits_per_value == 0) { layout.bits_per_value = value_layout.bits_per_value; }
+        if (layout.bits_per_offset == 0) {
+          layout.bits_per_offset = value_layout.bits_per_offset;
+        }
+        break;
+      }
+      default: reader.skip(type); break;
     }
   }
-  CUDF_EXPECTS(layout.bits_per_value > 0, "Only Lance MiniBlock page layout is supported");
+  CUDF_EXPECTS(layout.num_items > 0, "Lance FullZip layout is missing num_items");
+  CUDF_EXPECTS(layout.bits_per_value > 0 || layout.bits_per_offset > 0,
+               "Lance FullZip layout is missing value details");
+  return layout;
+}
+
+lance_page_layout parse_page_layout(proto_reader reader)
+{
+  lance_page_layout layout;
+  bool found_layout = false;
+  int field{};
+  wire_type type{};
+  while (reader.next(field, type)) {
+    switch (field) {
+      case 1:
+        expect_wire_type(type, wire_type::length_delimited, "PageLayout.mini_block_layout");
+        layout       = parse_miniblock_layout(reader.read_message());
+        found_layout = true;
+        break;
+      case 3:
+        expect_wire_type(type, wire_type::length_delimited, "PageLayout.full_zip_layout");
+        layout       = parse_fullzip_layout(reader.read_message());
+        found_layout = true;
+        break;
+      default: reader.skip(type); break;
+    }
+  }
+  CUDF_EXPECTS(found_layout, "Unsupported Lance page layout");
   return layout;
 }
 
@@ -893,7 +1069,12 @@ lance_field_info parse_field(proto_reader reader)
   CUDF_EXPECTS(parent_id == -1, "Only top-level Lance fields are supported");
   CUDF_EXPECTS(!name.empty(), "Lance field is missing a name");
   CUDF_EXPECTS(!logical.empty(), "Lance field is missing a logical type");
+  auto kind  = lance_logical_kind::FIXED_WIDTH;
   auto dtype = data_type_from_lance_logical_type(logical);
+  if (logical == "large_binary") {
+    kind  = lance_logical_kind::LARGE_BINARY;
+    dtype = data_type{type_id::LIST};
+  }
   std::string unsupported_reason;
   if (nullable) { unsupported_reason = "nullable field"; }
   if (!dtype.has_value()) {
@@ -901,7 +1082,7 @@ lance_field_info parse_field(proto_reader reader)
     unsupported_reason += "unsupported logical type: " + logical;
   }
   if (!unsupported_reason.empty()) { dtype = std::nullopt; }
-  return lance_field_info{name, dtype, nullable, logical, unsupported_reason};
+  return lance_field_info{name, dtype, kind, nullable, logical, unsupported_reason};
 }
 
 std::vector<lance_field_info> parse_schema(proto_reader reader)
@@ -967,10 +1148,22 @@ lance_page_info parse_page_metadata(proto_reader reader)
       default: reader.skip(type); break;
     }
   }
-  CUDF_EXPECTS(page.buffer_offsets.size() == 2 && page.buffer_sizes.size() == 2,
-               "Only two-buffer Lance MiniBlock pages are supported");
-  CUDF_EXPECTS(page.length == page.layout.num_items,
-               "Lance MiniBlock page length does not match num_items");
+  if (page.layout.kind == lance_page_layout_kind::MINIBLOCK) {
+    CUDF_EXPECTS(page.buffer_offsets.size() == 2 && page.buffer_sizes.size() == 2,
+                 "Only two-buffer Lance MiniBlock pages are supported");
+    CUDF_EXPECTS(page.length == page.layout.num_items,
+                 "Lance MiniBlock page length does not match num_items");
+  } else {
+    CUDF_EXPECTS(page.layout.kind == lance_page_layout_kind::FULL_ZIP,
+                 "Unsupported Lance page layout");
+    CUDF_EXPECTS(page.buffer_offsets.size() == 2 && page.buffer_sizes.size() == 2,
+                 "Only two-buffer Lance FullZip pages are supported");
+    CUDF_EXPECTS(page.length == page.layout.num_items,
+                 "Lance FullZip page length does not match num_items");
+    CUDF_EXPECTS(page.layout.num_visible_items == 0 ||
+                   page.length == page.layout.num_visible_items,
+                 "Lance FullZip page has invisible items");
+  }
   return page;
 }
 
@@ -1387,6 +1580,8 @@ page_data_buffers read_page_data_buffers(datasource* source,
   std::uint64_t end   = 0;
   std::uint64_t total = 0;
   for (auto const& page : pages) {
+    CUDF_EXPECTS(page.layout.kind == lance_page_layout_kind::MINIBLOCK,
+                 "Lance dense fixed-width reader requires MiniBlock pages");
     auto const offset = page.buffer_offsets[1];
     auto const size   = page.buffer_sizes[1];
     CUDF_EXPECTS(offset <= source->size() && size <= source->size() - offset,
@@ -1492,6 +1687,8 @@ std::vector<miniblock_chunk_info> parse_miniblock_chunks(std::uint8_t const* met
 std::vector<miniblock_chunk_info> read_miniblock_chunks(datasource* source,
                                                         lance_page_info const& page)
 {
+  CUDF_EXPECTS(page.layout.kind == lance_page_layout_kind::MINIBLOCK,
+               "Lance MiniBlock metadata requested for a non-MiniBlock page");
   auto const metadata = read_host_bytes(source, page.buffer_offsets[0], page.buffer_sizes[0]);
   return parse_miniblock_chunks(metadata.data(), metadata.size(), page);
 }
@@ -1506,6 +1703,8 @@ std::vector<std::vector<miniblock_chunk_info>> read_miniblock_chunks(
   std::uint64_t end   = 0;
   std::uint64_t total = 0;
   for (auto const& page : pages) {
+    CUDF_EXPECTS(page.layout.kind == lance_page_layout_kind::MINIBLOCK,
+                 "Lance MiniBlock metadata requested for a non-MiniBlock page");
     auto const offset = page.buffer_offsets[0];
     auto const size   = page.buffer_sizes[0];
     CUDF_EXPECTS(offset <= source->size() && size <= source->size() - offset,
@@ -1588,6 +1787,19 @@ struct pending_lance_column {
   std::size_t type_width{};
   std::vector<pending_lance_page> pages;
   std::vector<pending_miniblock_chunk> chunks;
+};
+
+struct pending_fullzip_binary_page {
+  size_type row_begin{};
+  size_type num_rows{};
+  std::uint64_t index_offset{};
+  std::uint64_t index_size{};
+  std::uint64_t data_offset{};
+  std::uint64_t data_size{};
+};
+
+struct pending_fullzip_binary_column {
+  std::vector<pending_fullzip_binary_page> pages;
 };
 
 void append_page_chunks(std::vector<pending_miniblock_chunk>& chunks,
@@ -2082,6 +2294,139 @@ std::vector<page_metadata> write_column_pages(
   return pages;
 }
 
+std::vector<size_type> copy_list_offsets_to_host(lists_column_view const& lists,
+                                                 rmm::cuda_stream_view stream)
+{
+  std::vector<size_type> offsets(static_cast<std::size_t>(lists.size()) + 1);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(offsets.data(),
+                                lists.offsets_begin(),
+                                offsets.size() * sizeof(size_type),
+                                cudaMemcpyDeviceToHost,
+                                stream.value()));
+  stream.synchronize();
+  return offsets;
+}
+
+std::vector<page_metadata> make_fullzip_binary_pages(
+  std::vector<pending_fullzip_binary_page> const& pending_pages)
+{
+  std::vector<page_metadata> pages;
+  pages.reserve(pending_pages.size());
+  for (auto const& pending_page : pending_pages) {
+    page_metadata page;
+    page.length   = pending_page.num_rows;
+    page.priority = pending_page.row_begin;
+    page.encoding =
+      make_fullzip_binary_page_encoding(static_cast<std::uint64_t>(pending_page.num_rows));
+    page.buffer_offsets.push_back(pending_page.data_offset);
+    page.buffer_offsets.push_back(pending_page.index_offset);
+    page.buffer_sizes.push_back(pending_page.data_size);
+    page.buffer_sizes.push_back(pending_page.index_size);
+    pages.push_back(std::move(page));
+  }
+  return pages;
+}
+
+std::vector<column_metadata> write_fullzip_binary_data_pages(
+  data_sink* sink, lance_writer_options const& options, rmm::cuda_stream_view stream)
+{
+  auto const& table       = options.get_table();
+  auto const page_rows_in = options.get_max_rows_per_page().value_or(default_rows_per_page);
+  CUDF_EXPECTS(page_rows_in > 0, "max_rows_per_page must be greater than zero");
+  CUDF_EXPECTS(table.num_rows() > 0,
+               "Lance large-binary writer currently requires at least one row");
+
+  auto const metadata_begin = sink->bytes_written();
+  std::vector<std::uint8_t> metadata_section;
+  std::vector<column_metadata> columns(table.num_columns());
+  std::vector<pending_fullzip_binary_column> pending_columns(table.num_columns());
+  std::vector<lance_fullzip_binary_pack> pack_spans;
+  std::uint64_t data_size = 0;
+
+  for (size_type col_idx = 0; col_idx < table.num_columns(); ++col_idx) {
+    auto const column = table.column(col_idx);
+    auto const lists  = lists_column_view{column};
+    auto const child  = lists.child();
+    auto const offsets = copy_list_offsets_to_host(lists, stream);
+    auto& pending_column = pending_columns[static_cast<std::size_t>(col_idx)];
+
+    for (size_type row = 0; row < table.num_rows(); row += page_rows_in) {
+      auto const rows = std::min(page_rows_in, table.num_rows() - row);
+      std::vector<std::uint8_t> index_buffer;
+      index_buffer.reserve((static_cast<std::size_t>(rows) + 1) * sizeof(std::uint64_t));
+      std::uint64_t page_data_size = 0;
+      write_little_endian_u64(index_buffer, page_data_size);
+
+      for (size_type local_row = 0; local_row < rows; ++local_row) {
+        auto const global_row = row + local_row;
+        auto const value_begin = offsets[static_cast<std::size_t>(global_row)];
+        auto const value_end   = offsets[static_cast<std::size_t>(global_row) + 1];
+        CUDF_EXPECTS(value_begin <= value_end, "Invalid list offsets for Lance large-binary write");
+        auto const input_size = static_cast<std::uint64_t>(value_end - value_begin);
+        auto const output_offset = data_size + page_data_size;
+        CUDF_EXPECTS(output_offset <= std::numeric_limits<std::size_t>::max(),
+                     "Lance large-binary data buffer is too large");
+        CUDF_EXPECTS(input_size <= std::numeric_limits<std::size_t>::max(),
+                     "Lance large-binary value is too large");
+        pack_spans.push_back(lance_fullzip_binary_pack{
+          child.head<std::uint8_t>() + value_begin,
+          static_cast<std::size_t>(input_size),
+          static_cast<std::size_t>(output_offset)});
+
+        page_data_size += sizeof(std::uint64_t) + input_size;
+        write_little_endian_u64(index_buffer, page_data_size);
+      }
+
+      auto const index_offset = metadata_begin + metadata_section.size();
+      auto const index_size   = static_cast<std::uint64_t>(index_buffer.size());
+      append_aligned_host_buffer(metadata_section, index_buffer);
+
+      pending_fullzip_binary_page page;
+      page.row_begin    = row;
+      page.num_rows     = rows;
+      page.index_offset = index_offset;
+      page.index_size   = index_size;
+      page.data_offset  = data_size;
+      page.data_size    = page_data_size;
+      pending_column.pages.push_back(page);
+
+      CUDF_EXPECTS(page_data_size <= std::numeric_limits<std::size_t>::max(),
+                   "Lance large-binary page is too large");
+      data_size += page_data_size + pad_size(static_cast<std::size_t>(page_data_size));
+      CUDF_EXPECTS(data_size <= std::numeric_limits<std::size_t>::max(),
+                   "Lance large-binary data buffer is too large");
+    }
+  }
+
+  write_host_buffer(sink, metadata_section.data(), metadata_section.size());
+  auto const data_begin = sink->bytes_written();
+  for (size_type col_idx = 0; col_idx < table.num_columns(); ++col_idx) {
+    auto& pending_column = pending_columns[static_cast<std::size_t>(col_idx)];
+    for (auto& page : pending_column.pages) {
+      page.data_offset += data_begin;
+    }
+    columns[col_idx].pages = make_fullzip_binary_pages(pending_column.pages);
+  }
+
+  rmm::device_uvector<std::uint8_t> data(static_cast<std::size_t>(data_size), stream);
+  if (data.size() > 0) {
+    CUDF_CUDA_TRY(cudaMemsetAsync(data.data(), lance_pad_byte, data.size(), stream.value()));
+  }
+  if (!pack_spans.empty()) {
+    rmm::device_uvector<lance_fullzip_binary_pack> device_pack_spans(pack_spans.size(), stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_pack_spans.data(),
+                                  pack_spans.data(),
+                                  pack_spans.size() * sizeof(lance_fullzip_binary_pack),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    pack_lance_fullzip_binary(
+      device_pack_spans.data(), device_pack_spans.size(), data.data(), stream);
+  }
+  write_device_buffer(sink, data.data(), data.size(), stream);
+
+  return columns;
+}
+
 std::vector<std::uint8_t> serialize_page(page_metadata const& page)
 {
   proto_writer out;
@@ -2136,6 +2481,18 @@ std::vector<column_metadata> write_data_pages(data_sink* sink,
 {
   auto const& table       = options.get_table();
   auto const compression  = options.get_compression();
+  auto const binary_columns =
+    std::count_if(table.begin(), table.end(), [](auto const& column) {
+      return column.type().id() == type_id::LIST;
+    });
+  if (binary_columns > 0) {
+    CUDF_EXPECTS(binary_columns == table.num_columns(),
+                 "Lance large-binary writer cannot mix image and fixed-width columns yet");
+    CUDF_EXPECTS(compression == compression_type::NONE,
+                 "Lance large-binary writer currently requires NONE compression");
+    return write_fullzip_binary_data_pages(sink, options, stream);
+  }
+
   auto const page_rows_in = options.get_max_rows_per_page().value_or(default_rows_per_page);
   auto const miniblock_rows_in =
     options.get_max_rows_per_miniblock().value_or(writer_default_rows_per_miniblock);
@@ -2247,8 +2604,19 @@ void validate_options(lance_writer_options const& options)
     CUDF_EXPECTS(is_supported_lance_type(column.type()),
                  "Unsupported Lance writer type for column " + std::to_string(idx) + ": " +
                    cudf::type_to_name(column.type()));
-    CUDF_EXPECTS(!column.has_nulls(),
-                 "Lance writer currently supports only non-null fixed-width columns");
+    if (column.type().id() == type_id::LIST) {
+      auto const lists = lists_column_view{column};
+      auto const child = lists.child();
+      CUDF_EXPECTS(!column.has_nulls(),
+                   "Lance large-binary writer currently supports only non-null image columns");
+      CUDF_EXPECTS(child.type().id() == type_id::UINT8,
+                   "Lance large-binary writer requires list<uint8> image columns");
+      CUDF_EXPECTS(!child.has_nulls(),
+                   "Lance large-binary writer does not support nullable image bytes");
+    } else {
+      CUDF_EXPECTS(!column.has_nulls(),
+                   "Lance writer currently supports only non-null fixed-width columns");
+    }
   }
 }
 
@@ -2370,6 +2738,11 @@ bool should_use_dense_for_sparse_selection(datasource* source,
   if (columns.size() < 2 || rows.empty()) { return false; }
 
   auto const& column_info = file_info.columns[columns.front()];
+  if (std::any_of(column_info.pages.begin(), column_info.pages.end(), [](auto const& page) {
+        return page.layout.kind != lance_page_layout_kind::MINIBLOCK;
+      })) {
+    return false;
+  }
   if (rows.size() < column_info.pages.size() * sparse_dense_fallback_min_rows_per_page) {
     return false;
   }
@@ -2464,7 +2837,10 @@ bool can_batch_sparse_zstd_columns(lance_file_info const& file_info,
 {
   for (auto column_idx : columns) {
     for (auto const& page : file_info.columns[column_idx].pages) {
-      if (page.layout.compression != compression_type::ZSTD) { return false; }
+      if (page.layout.kind != lance_page_layout_kind::MINIBLOCK ||
+          page.layout.compression != compression_type::ZSTD) {
+        return false;
+      }
     }
   }
   return true;
@@ -2548,7 +2924,7 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(field.type.has_value(),
+  CUDF_EXPECTS(field.kind == lance_logical_kind::FIXED_WIDTH && field.type.has_value(),
                "Unsupported Lance column selected: " + field.name + " (" +
                  field.unsupported_reason + ")");
   auto const field_type = *field.type;
@@ -2596,7 +2972,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   if (file_info.num_rows == 0) {
     for (auto column_idx : columns) {
       auto const& field = file_info.fields[column_idx];
-      CUDF_EXPECTS(field.type.has_value(),
+      CUDF_EXPECTS(field.kind == lance_logical_kind::FIXED_WIDTH && field.type.has_value(),
                    "Unsupported Lance column selected: " + field.name + " (" +
                      field.unsupported_reason + ")");
       output_columns.push_back(
@@ -2609,7 +2985,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   for (auto column_idx : columns) {
     auto const& field       = file_info.fields[column_idx];
     auto const& column_info = file_info.columns[column_idx];
-    CUDF_EXPECTS(field.type.has_value(),
+    CUDF_EXPECTS(field.kind == lance_logical_kind::FIXED_WIDTH && field.type.has_value(),
                  "Unsupported Lance column selected: " + field.name + " (" +
                    field.unsupported_reason + ")");
     auto const field_type = *field.type;
@@ -2648,7 +3024,7 @@ std::unique_ptr<column> read_lance_column(datasource* source,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(field.type.has_value(),
+  CUDF_EXPECTS(field.kind == lance_logical_kind::FIXED_WIDTH && field.type.has_value(),
                "Unsupported Lance column selected: " + field.name + " (" +
                  field.unsupported_reason + ")");
   auto const field_type = *field.type;
@@ -2872,7 +3248,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   if (rows.empty()) {
     for (auto column_idx : columns) {
       auto const& field = file_info.fields[column_idx];
-      CUDF_EXPECTS(field.type.has_value(),
+      CUDF_EXPECTS(field.kind == lance_logical_kind::FIXED_WIDTH && field.type.has_value(),
                    "Unsupported Lance column selected: " + field.name + " (" +
                      field.unsupported_reason + ")");
       output_columns.push_back(
@@ -2965,7 +3341,7 @@ std::vector<std::unique_ptr<column>> read_lance_columns(datasource* source,
   for (auto column_idx : columns) {
     auto const& field       = file_info.fields[column_idx];
     auto const& column_info = file_info.columns[column_idx];
-    CUDF_EXPECTS(field.type.has_value(),
+    CUDF_EXPECTS(field.kind == lance_logical_kind::FIXED_WIDTH && field.type.has_value(),
                  "Unsupported Lance column selected: " + field.name + " (" +
                    field.unsupported_reason + ")");
     auto const field_type = *field.type;
@@ -3807,6 +4183,24 @@ struct bulk_pending_device_read {
   std::uint8_t* output{};
 };
 
+struct bulk_fullzip_binary_plan {
+  std::size_t source_idx{};
+  std::uint64_t offset{};
+  std::uint64_t size{};
+  std::size_t length_prefix_size{};
+  compression_type compression{};
+  size_type output_row{};
+  std::size_t output_offset{};
+  std::size_t output_size{};
+  std::uint8_t const* input{};
+};
+
+std::vector<std::string> lance_file_info_columns_for_bulk(
+  std::vector<std::string> const& requested_columns)
+{
+  return requested_columns;
+}
+
 std::vector<size_type> selected_rows(lance_file_info const& file_info,
                                      std::vector<size_type> const& requested_rows)
 {
@@ -3832,6 +4226,45 @@ table_metadata make_bulk_table_metadata(std::vector<std::string> const& column_n
   }
   metadata.num_rows_per_source = std::move(num_rows_per_source);
   return metadata;
+}
+
+std::uint64_t read_little_endian_packed(std::uint8_t const* data, std::size_t size)
+{
+  CUDF_EXPECTS(size > 0 && size <= sizeof(std::uint64_t),
+               "Invalid Lance packed integer width");
+  std::uint64_t value = 0;
+  for (std::size_t idx = 0; idx < size; ++idx) {
+    value |= static_cast<std::uint64_t>(data[idx]) << (idx * 8);
+  }
+  return value;
+}
+
+std::size_t fullzip_length_prefix_size(lance_page_info const& page)
+{
+  CUDF_EXPECTS(page.layout.kind == lance_page_layout_kind::FULL_ZIP,
+               "Lance large binary reader requires FullZip pages");
+  CUDF_EXPECTS(page.layout.bits_rep == 0 && page.layout.bits_def == 0,
+               "Lance large binary reader does not support repetition or definition levels");
+  CUDF_EXPECTS(page.layout.bits_per_offset > 0 && page.layout.bits_per_offset % 8 == 0,
+               "Lance FullZip variable offsets must be byte-aligned");
+  auto const bytes = page.layout.bits_per_offset / 8;
+  CUDF_EXPECTS(bytes <= std::numeric_limits<std::size_t>::max(),
+               "Lance FullZip offset width is too large");
+  return static_cast<std::size_t>(bytes);
+}
+
+std::size_t fullzip_repetition_index_entry_size(lance_page_info const& page)
+{
+  CUDF_EXPECTS(page.length <=
+                 std::numeric_limits<std::uint64_t>::max() - std::uint64_t{1},
+               "Lance FullZip page length is too large");
+  auto const entries = page.length + 1;
+  CUDF_EXPECTS(entries > 0 && page.buffer_sizes[1] % entries == 0,
+               "Invalid Lance FullZip repetition index buffer");
+  auto const bytes = page.buffer_sizes[1] / entries;
+  CUDF_EXPECTS(bytes > 0 && bytes <= sizeof(std::uint64_t),
+               "Unsupported Lance FullZip repetition index width");
+  return static_cast<std::size_t>(bytes);
 }
 
 void read_device_byte_ranges_into(std::vector<std::unique_ptr<datasource>> const& sources,
@@ -3929,6 +4362,333 @@ void assign_coalesced_bulk_reads(
     ++metrics.file_ranges_after_coalescing;
     begin = end;
   }
+}
+
+void assign_coalesced_fullzip_binary_reads(
+  std::vector<bulk_fullzip_binary_plan>& binary_plans,
+  std::vector<rmm::device_uvector<std::uint8_t>>& input_buffers,
+  std::vector<bulk_pending_device_read>& pending_reads,
+  lance_read_metrics& metrics,
+  std::uint64_t coalesce_gap_bytes,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (binary_plans.empty()) { return; }
+
+  std::vector<std::size_t> ordered(binary_plans.size());
+  std::iota(ordered.begin(), ordered.end(), std::size_t{0});
+  std::sort(ordered.begin(), ordered.end(), [&](auto lhs, auto rhs) {
+    auto const& lhs_plan = binary_plans[lhs];
+    auto const& rhs_plan = binary_plans[rhs];
+    return std::tie(lhs_plan.source_idx, lhs_plan.offset) <
+           std::tie(rhs_plan.source_idx, rhs_plan.offset);
+  });
+
+  metrics.file_ranges_before_coalescing += binary_plans.size();
+  input_buffers.reserve(input_buffers.size() + binary_plans.size());
+  pending_reads.reserve(pending_reads.size() + binary_plans.size());
+
+  for (std::size_t begin = 0; begin < ordered.size();) {
+    auto const source_idx = binary_plans[ordered[begin]].source_idx;
+    auto range_begin      = binary_plans[ordered[begin]].offset;
+    auto range_end        = range_begin + binary_plans[ordered[begin]].size;
+    auto end              = begin + 1;
+    while (end < ordered.size()) {
+      auto const& next = binary_plans[ordered[end]];
+      if (next.source_idx != source_idx) { break; }
+      auto const next_end = next.offset + next.size;
+      auto const gap      = next.offset > range_end ? next.offset - range_end : 0;
+      if (gap > coalesce_gap_bytes) { break; }
+      range_end = std::max(range_end, next_end);
+      ++end;
+    }
+
+    auto const range_size = range_end - range_begin;
+    CUDF_EXPECTS(range_size <=
+                   static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
+                 "Lance coalesced large-binary read range is too large");
+    input_buffers.emplace_back(static_cast<std::size_t>(range_size), stream, mr);
+    auto* range_data = input_buffers.back().data();
+    for (auto idx = begin; idx < end; ++idx) {
+      auto& plan = binary_plans[ordered[idx]];
+      CUDF_EXPECTS(plan.offset >= range_begin && plan.size <= range_size &&
+                     plan.offset - range_begin <= range_size - plan.size,
+                   "Lance FullZip value is outside the coalesced sparse read range");
+      plan.input = range_data + static_cast<std::size_t>(plan.offset - range_begin);
+    }
+    pending_reads.push_back(
+      bulk_pending_device_read{source_idx, range_begin, range_size, range_data});
+    metrics.coalesced_file_bytes_read += range_size;
+    ++metrics.file_ranges_after_coalescing;
+    begin = end;
+  }
+}
+
+lance_bulk_read_result read_lance_bulk_large_binary(
+  std::vector<std::unique_ptr<datasource>> const& sources,
+  std::vector<bulk_lance_source_plan> const& source_plans,
+  std::vector<std::string> const& column_names,
+  std::vector<std::size_t> num_rows_per_source,
+  std::size_t total_rows,
+  lance_bulk_reader_options const& options,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(column_names.size() == 1,
+               "Lance bulk large-binary reader currently supports one projected column");
+  CUDF_EXPECTS(total_rows <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
+               "Lance bulk row selection contains too many rows for cuDF");
+  CUDF_EXPECTS(total_rows < static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
+               "Lance bulk row selection contains too many rows for cuDF list offsets");
+  auto const output_num_rows = static_cast<size_type>(total_rows);
+
+  lance_read_metrics metrics;
+  metrics.rows_requested = static_cast<std::uint64_t>(total_rows);
+
+  std::vector<std::size_t> value_sizes(total_rows);
+  std::vector<bulk_fullzip_binary_plan> binary_plans;
+  binary_plans.reserve(total_rows);
+
+  for (std::size_t source_idx = 0; source_idx < source_plans.size(); ++source_idx) {
+    auto const& source_plan = source_plans[source_idx];
+    if (source_plan.rows.empty()) { continue; }
+    CUDF_EXPECTS(source_plan.columns.size() == 1,
+                 "Lance bulk large-binary reader received multiple projected columns");
+    ++metrics.files_touched;
+    metrics.columns_touched += 1;
+
+    auto const binary_column_idx = source_plan.columns.front();
+    auto const& binary_field     = source_plan.file_info.fields[binary_column_idx];
+    CUDF_EXPECTS(binary_field.kind == lance_logical_kind::LARGE_BINARY,
+                 "Lance bulk large-binary reader requires a large_binary column");
+    auto const& column_info = source_plan.file_info.columns[binary_column_idx];
+    std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_page(
+      column_info.pages.size());
+    for (std::size_t local_row = 0; local_row < source_plan.rows.size(); ++local_row) {
+      auto const selected_row = source_plan.rows[local_row];
+      auto const page_idx     = find_page_for_row(column_info.pages, selected_row);
+      auto const& page        = column_info.pages[page_idx];
+      auto const row_in_page =
+        static_cast<size_type>(static_cast<std::uint64_t>(selected_row) - page.priority);
+      auto const output_row = static_cast<size_type>(source_plan.output_row_begin + local_row);
+      rows_by_page[page_idx].emplace_back(output_row, row_in_page);
+    }
+
+    for (std::size_t page_idx = 0; page_idx < column_info.pages.size(); ++page_idx) {
+      auto const& page_rows = rows_by_page[page_idx];
+      if (page_rows.empty()) { continue; }
+      auto const& page = column_info.pages[page_idx];
+      CUDF_EXPECTS(page.layout.kind == lance_page_layout_kind::FULL_ZIP,
+                   "Lance large-binary reader requires FullZip pages");
+      CUDF_EXPECTS(page.layout.compression == compression_type::ZSTD ||
+                     page.layout.compression == compression_type::NONE,
+                   "Lance large-binary reader currently supports ZSTD and NONE values");
+      auto const value_prefix_size = fullzip_length_prefix_size(page);
+      CUDF_EXPECTS(value_prefix_size <= std::numeric_limits<std::size_t>::max() / 2,
+                   "Lance FullZip prefix width is too large");
+      auto const encoded_prefix_size = page.layout.compression == compression_type::ZSTD
+                                         ? value_prefix_size * 2
+                                         : value_prefix_size;
+      auto const index_entry_size   = fullzip_repetition_index_entry_size(page);
+      auto const index_bytes = read_host_bytes(source_plan.source,
+                                               page.buffer_offsets[1],
+                                               page.buffer_sizes[1]);
+      ++metrics.touched_miniblocks;
+
+      for (auto const& [output_row, row_in_page] : page_rows) {
+        auto const row_idx = static_cast<std::uint64_t>(row_in_page);
+        CUDF_EXPECTS(row_idx < page.length, "Lance FullZip row is out of page bounds");
+        auto const* begin_ptr =
+          index_bytes.data() + static_cast<std::size_t>(row_idx) * index_entry_size;
+        auto const* end_ptr =
+          index_bytes.data() + static_cast<std::size_t>(row_idx + 1) * index_entry_size;
+        auto const span_begin = read_little_endian_packed(begin_ptr, index_entry_size);
+        auto const span_end   = read_little_endian_packed(end_ptr, index_entry_size);
+        CUDF_EXPECTS(span_begin <= span_end && span_end <= page.buffer_sizes[0],
+                     "Lance FullZip repetition index points outside the data buffer");
+        auto const span_size = span_end - span_begin;
+        CUDF_EXPECTS(span_size >= encoded_prefix_size,
+                     "Lance FullZip variable value is missing its length prefixes");
+        auto const value_offset = page.buffer_offsets[0] + span_begin;
+        auto const encoded_size = span_size - encoded_prefix_size;
+        binary_plans.push_back(bulk_fullzip_binary_plan{source_idx,
+                                                        value_offset,
+                                                        span_size,
+                                                        encoded_prefix_size,
+                                                        page.layout.compression,
+                                                        output_row,
+                                                        0,
+                                                        page.layout.compression == compression_type::NONE
+                                                          ? static_cast<std::size_t>(encoded_size)
+                                                          : std::size_t{0},
+                                                        nullptr});
+
+        value_sizes[output_row] =
+          page.layout.compression == compression_type::NONE
+            ? static_cast<std::size_t>(encoded_size)
+            : std::size_t{0};
+        metrics.compressed_miniblock_bytes_touched += encoded_size;
+        if (page.layout.compression == compression_type::NONE) {
+          metrics.uncompressed_miniblock_bytes_decompressed += encoded_size;
+        }
+      }
+    }
+  }
+
+  std::vector<rmm::device_uvector<std::uint8_t>> input_buffers;
+  std::vector<bulk_pending_device_read> pending_reads;
+  assign_coalesced_fullzip_binary_reads(binary_plans,
+                                        input_buffers,
+                                        pending_reads,
+                                        metrics,
+                                        options.get_read_coalesce_gap_bytes(),
+                                        stream,
+                                        mr);
+  read_device_byte_ranges_into(sources, pending_reads, stream);
+
+  std::vector<std::size_t> zstd_prefix_plan_indices;
+  zstd_prefix_plan_indices.reserve(binary_plans.size());
+  for (std::size_t plan_idx = 0; plan_idx < binary_plans.size(); ++plan_idx) {
+    if (binary_plans[plan_idx].compression == compression_type::ZSTD) {
+      zstd_prefix_plan_indices.push_back(plan_idx);
+    }
+  }
+
+  if (!zstd_prefix_plan_indices.empty()) {
+    auto prefix_inputs =
+      cudf::detail::hostdevice_vector<lance_fullzip_binary_prefix>(zstd_prefix_plan_indices.size(),
+                                                                   stream);
+    for (std::size_t prefix_idx = 0; prefix_idx < zstd_prefix_plan_indices.size(); ++prefix_idx) {
+      auto const plan_idx = zstd_prefix_plan_indices[prefix_idx];
+      auto const& plan = binary_plans[plan_idx];
+      CUDF_EXPECTS(plan.input != nullptr,
+                   "Lance large-binary sparse read was not assigned input");
+      CUDF_EXPECTS(plan.length_prefix_size > 0 && plan.length_prefix_size % 2 == 0,
+                   "Invalid Lance FullZip binary prefix width");
+      prefix_inputs[prefix_idx] =
+        lance_fullzip_binary_prefix{plan.input, plan.length_prefix_size / 2};
+    }
+    prefix_inputs.host_to_device_async(stream);
+
+    auto decoded_prefixes =
+      cudf::detail::hostdevice_vector<std::uint64_t>(zstd_prefix_plan_indices.size() * 2, stream);
+    decode_lance_fullzip_binary_prefixes(prefix_inputs.device_ptr(),
+                                         decoded_prefixes.device_ptr(),
+                                         zstd_prefix_plan_indices.size(),
+                                         stream);
+    decoded_prefixes.device_to_host(stream);
+
+    for (std::size_t prefix_idx = 0; prefix_idx < zstd_prefix_plan_indices.size(); ++prefix_idx) {
+      auto const plan_idx = zstd_prefix_plan_indices[prefix_idx];
+      auto& plan = binary_plans[plan_idx];
+      auto const value_prefix_size = plan.length_prefix_size / 2;
+      auto const outer_value_size  = decoded_prefixes[prefix_idx * 2];
+      CUDF_EXPECTS(outer_value_size == plan.size - value_prefix_size,
+                   "Lance FullZip outer value length does not match repetition index");
+      auto const output_size = decoded_prefixes[prefix_idx * 2 + 1];
+      CUDF_EXPECTS(output_size <= std::numeric_limits<std::size_t>::max(),
+                   "Lance large-binary output value is too large");
+      plan.output_size = static_cast<std::size_t>(output_size);
+      value_sizes[plan.output_row] = plan.output_size;
+      metrics.uncompressed_miniblock_bytes_decompressed += output_size;
+    }
+  }
+
+  std::vector<size_type> offsets(total_rows + 1, 0);
+  std::uint64_t total_value_bytes = 0;
+  for (std::size_t row = 0; row < total_rows; ++row) {
+    auto const size = value_sizes[row];
+    auto const size_u64 = static_cast<std::uint64_t>(size);
+    CUDF_EXPECTS(total_value_bytes <=
+                   static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()) &&
+                   size_u64 <=
+                     static_cast<std::uint64_t>(std::numeric_limits<size_type>::max()) -
+                       total_value_bytes,
+                 "Lance large-binary output exceeds cuDF list offset limits");
+    total_value_bytes += size_u64;
+    offsets[row + 1] = static_cast<size_type>(total_value_bytes);
+  }
+  for (auto& plan : binary_plans) {
+    plan.output_offset = static_cast<std::size_t>(offsets[plan.output_row]);
+  }
+
+  auto offsets_column = cudf::make_fixed_width_column(data_type{type_id::INT32},
+                                                      output_num_rows + 1,
+                                                      mask_state::UNALLOCATED,
+                                                      stream,
+                                                      mr);
+  CUDF_CUDA_TRY(cudf::detail::memcpy_async(offsets_column->mutable_view().head<size_type>(),
+                                           offsets.data(),
+                                           offsets.size() * sizeof(size_type),
+                                           stream));
+
+  auto child_column = cudf::make_fixed_width_column(data_type{type_id::UINT8},
+                                                    static_cast<size_type>(total_value_bytes),
+                                                    mask_state::UNALLOCATED,
+                                                    stream,
+                                                    mr);
+  auto* child_data = child_column->mutable_view().head<std::uint8_t>();
+
+  metrics.requested_output_bytes = total_value_bytes;
+
+  std::vector<device_span<std::uint8_t const>> inputs;
+  std::vector<device_span<std::uint8_t>> outputs;
+  std::vector<std::size_t> output_sizes;
+  std::vector<lance_binary_copy_span> copy_spans;
+  inputs.reserve(binary_plans.size());
+  outputs.reserve(binary_plans.size());
+  output_sizes.reserve(binary_plans.size());
+  copy_spans.reserve(binary_plans.size());
+  std::size_t total_decompress_size = 0;
+  std::size_t max_decompress_size   = 0;
+  for (auto const& plan : binary_plans) {
+    if (plan.output_size == 0) { continue; }
+    CUDF_EXPECTS(plan.input != nullptr, "Lance large-binary sparse read was not assigned input");
+    CUDF_EXPECTS(plan.size >= plan.length_prefix_size,
+                 "Invalid Lance large-binary compressed span");
+    auto const compressed_size = static_cast<std::size_t>(plan.size - plan.length_prefix_size);
+    auto const* input = plan.input + plan.length_prefix_size;
+    auto* output      = child_data + plan.output_offset;
+    if (plan.compression == compression_type::ZSTD) {
+      inputs.push_back(device_span<std::uint8_t const>{input, compressed_size});
+      outputs.push_back(device_span<std::uint8_t>{output, plan.output_size});
+      output_sizes.push_back(plan.output_size);
+      total_decompress_size += plan.output_size;
+      max_decompress_size = std::max(max_decompress_size, plan.output_size);
+    } else {
+      CUDF_EXPECTS(plan.compression == compression_type::NONE,
+                   "Unsupported Lance large-binary compression");
+      CUDF_EXPECTS(compressed_size == plan.output_size,
+                   "Uncompressed Lance large-binary value has unexpected size");
+      copy_spans.push_back(lance_binary_copy_span{input, output, plan.output_size});
+    }
+  }
+  if (!inputs.empty()) {
+    decompress_zstd_device_batch_into(
+      inputs, outputs, output_sizes, max_decompress_size, total_decompress_size, stream);
+  }
+  if (!copy_spans.empty()) {
+    rmm::device_uvector<lance_binary_copy_span> device_copy_spans(copy_spans.size(), stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_copy_spans.data(),
+                                  copy_spans.data(),
+                                  copy_spans.size() * sizeof(lance_binary_copy_span),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    copy_lance_binary_spans(device_copy_spans.data(), device_copy_spans.size(), stream);
+  }
+
+  std::vector<std::unique_ptr<column>> output_columns;
+  output_columns.push_back(cudf::make_lists_column(output_num_rows,
+                                                   std::move(offsets_column),
+                                                   std::move(child_column),
+                                                   0,
+                                                   rmm::device_buffer{}));
+
+  lance_bulk_read_result result;
+  result.data.tbl      = std::make_unique<table>(std::move(output_columns));
+  result.data.metadata = make_bulk_table_metadata(column_names, std::move(num_rows_per_source));
+  result.metrics       = metrics;
+  return result;
 }
 
 }  // namespace
@@ -4064,36 +4824,58 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
   source_plans.reserve(sources.size());
   std::vector<std::string> column_names;
   std::vector<data_type> output_types;
+  std::vector<lance_logical_kind> output_kinds;
   std::vector<std::size_t> type_widths;
   std::vector<std::size_t> num_rows_per_source;
   num_rows_per_source.reserve(sources.size());
 
-  std::size_t total_rows = 0;
-  for (std::size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
-    auto file_info = read_lance_file_info(sources[source_idx].get(), options.get_columns());
-    std::vector<size_type> columns;
-    if (source_idx == 0) {
-      columns = selected_columns(file_info, options.get_columns());
+  auto const file_info_columns = lance_file_info_columns_for_bulk(options.get_columns());
+  auto initialize_output_schema =
+    [&](lance_file_info const& file_info, std::vector<size_type> const& columns) {
       column_names.reserve(columns.size());
       output_types.reserve(columns.size());
+      output_kinds.reserve(columns.size());
       type_widths.reserve(columns.size());
       for (auto column_idx : columns) {
         auto const& field = file_info.fields[column_idx];
-        CUDF_EXPECTS(field.type.has_value(),
+        CUDF_EXPECTS(field.is_supported(),
                      "Requested Lance column is not supported: " + field.name + " (" +
                        field.unsupported_reason + ")");
         column_names.push_back(field.name);
         output_types.push_back(*field.type);
-        type_widths.push_back(cudf::size_of(*field.type));
+        output_kinds.push_back(field.kind);
+        type_widths.push_back(field.kind == lance_logical_kind::FIXED_WIDTH
+                                ? cudf::size_of(*field.type)
+                                : std::size_t{0});
       }
+    };
+
+  bool schema_initialized = false;
+  std::size_t total_rows = 0;
+  for (std::size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
+    if (requested_rows_per_source[source_idx].empty()) {
+      num_rows_per_source.push_back(0);
+      source_plans.push_back(
+        bulk_lance_source_plan{sources[source_idx].get(), {}, {}, {}, total_rows});
+      continue;
+    }
+
+    auto file_info = read_lance_file_info(sources[source_idx].get(), file_info_columns);
+    std::vector<size_type> columns;
+    if (!schema_initialized) {
+      columns = selected_columns(file_info, options.get_columns());
+      initialize_output_schema(file_info, columns);
+      schema_initialized = true;
     } else {
       columns = selected_columns(file_info, column_names);
       CUDF_EXPECTS(columns.size() == output_types.size(),
                    "Lance bulk reader source schema does not match the first source");
       for (std::size_t column_idx = 0; column_idx < columns.size(); ++column_idx) {
         auto const& field = file_info.fields[columns[column_idx]];
-        CUDF_EXPECTS(field.type.has_value() && *field.type == output_types[column_idx],
-                     "Lance bulk reader requires matching fixed-width column schemas");
+        CUDF_EXPECTS(field.is_supported() && field.type.has_value() &&
+                       *field.type == output_types[column_idx] &&
+                       field.kind == output_kinds[column_idx],
+                     "Lance bulk reader requires matching column schemas");
       }
     }
 
@@ -4107,15 +4889,38 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
     num_rows_per_source.push_back(rows.size());
     source_plans.push_back(
       bulk_lance_source_plan{sources[source_idx].get(),
-                             std::move(file_info),
-                             std::move(columns),
-                             std::move(rows),
-                             output_row_begin});
+	                             std::move(file_info),
+	                             std::move(columns),
+	                             std::move(rows),
+	                             output_row_begin});
+  }
+
+  if (!schema_initialized) {
+    auto file_info = read_lance_file_info(sources.front().get(), file_info_columns);
+    auto columns   = selected_columns(file_info, options.get_columns());
+    initialize_output_schema(file_info, columns);
+    source_plans.front().file_info = std::move(file_info);
+    source_plans.front().columns   = std::move(columns);
   }
 
   CUDF_EXPECTS(total_rows <= static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
                "Lance bulk row selection contains too many rows for cuDF");
   auto const output_num_rows = static_cast<size_type>(total_rows);
+
+  auto const large_binary_columns =
+    std::count(output_kinds.begin(), output_kinds.end(), lance_logical_kind::LARGE_BINARY);
+  if (large_binary_columns > 0) {
+    CUDF_EXPECTS(large_binary_columns == static_cast<std::ptrdiff_t>(column_names.size()),
+                 "Lance bulk large-binary reads cannot mix fixed-width columns yet");
+    return read_lance_bulk_large_binary(sources,
+                                        source_plans,
+                                        column_names,
+                                        std::move(num_rows_per_source),
+                                        total_rows,
+                                        options,
+                                        stream,
+                                        mr);
+  }
 
   std::vector<std::unique_ptr<column>> output_columns;
   output_columns.reserve(output_types.size());
@@ -4140,6 +4945,12 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
   std::vector<bulk_single_row_copy_plan> single_row_copy_plans;
   std::vector<size_type> flat_source_rows;
   std::vector<size_type> flat_target_rows;
+  auto const max_sparse_chunks = total_rows * output_types.size();
+  miniblock_plans.reserve(max_sparse_chunks);
+  copy_plans.reserve(max_sparse_chunks);
+  single_row_copy_plans.reserve(max_sparse_chunks);
+  flat_source_rows.reserve(max_sparse_chunks);
+  flat_target_rows.reserve(max_sparse_chunks);
   std::size_t total_raw_size = 0;
 
   for (std::size_t source_idx = 0; source_idx < source_plans.size(); ++source_idx) {
@@ -4147,6 +4958,31 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
     if (source_plan.rows.empty()) { continue; }
     ++metrics.files_touched;
     metrics.columns_touched += source_plan.columns.size();
+
+    auto const can_share_page_rows =
+      source_plan.columns.size() > 1 &&
+      std::all_of(source_plan.columns.begin() + 1,
+                  source_plan.columns.end(),
+                  [&](auto column_idx) {
+                    return have_same_page_rows(
+                      source_plan.file_info.columns[source_plan.columns.front()],
+                      source_plan.file_info.columns[column_idx]);
+                  });
+    std::vector<std::vector<std::pair<size_type, size_type>>> shared_rows_by_page;
+    if (can_share_page_rows) {
+      auto const& pages = source_plan.file_info.columns[source_plan.columns.front()].pages;
+      shared_rows_by_page.resize(pages.size());
+      for (std::size_t local_row = 0; local_row < source_plan.rows.size(); ++local_row) {
+        auto const selected_row = source_plan.rows[local_row];
+        auto const page_idx     = find_page_for_row(pages, selected_row);
+        auto const& page        = pages[page_idx];
+        auto const row_in_page =
+          static_cast<size_type>(static_cast<std::uint64_t>(selected_row) - page.priority);
+        auto const output_row =
+          static_cast<size_type>(source_plan.output_row_begin + local_row);
+        shared_rows_by_page[page_idx].emplace_back(output_row, row_in_page);
+      }
+    }
 
     for (std::size_t output_column_idx = 0; output_column_idx < source_plan.columns.size();
          ++output_column_idx) {
@@ -4157,22 +4993,28 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
 
       std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_page(
         column_info.pages.size());
-      for (std::size_t local_row = 0; local_row < source_plan.rows.size(); ++local_row) {
-        auto const selected_row = source_plan.rows[local_row];
-        auto const page_idx     = find_page_for_row(column_info.pages, selected_row);
-        auto const& page        = column_info.pages[page_idx];
-        auto const row_in_page =
-          static_cast<size_type>(static_cast<std::uint64_t>(selected_row) - page.priority);
-        auto const output_row =
-          static_cast<size_type>(source_plan.output_row_begin + local_row);
-        rows_by_page[page_idx].emplace_back(output_row, row_in_page);
+      auto const* rows_by_page_ptr = &rows_by_page;
+      if (can_share_page_rows) {
+        rows_by_page_ptr = &shared_rows_by_page;
+      } else {
+        for (std::size_t local_row = 0; local_row < source_plan.rows.size(); ++local_row) {
+          auto const selected_row = source_plan.rows[local_row];
+          auto const page_idx     = find_page_for_row(column_info.pages, selected_row);
+          auto const& page        = column_info.pages[page_idx];
+          auto const row_in_page =
+            static_cast<size_type>(static_cast<std::uint64_t>(selected_row) - page.priority);
+          auto const output_row =
+            static_cast<size_type>(source_plan.output_row_begin + local_row);
+          rows_by_page[page_idx].emplace_back(output_row, row_in_page);
+        }
       }
+      auto const& selected_rows_by_page = *rows_by_page_ptr;
 
       std::vector<std::vector<miniblock_chunk_info>> chunks_by_page(column_info.pages.size());
       auto const touched_page_indices =
         read_touched_miniblock_chunks(source_plan.source,
                                       column_info.pages,
-                                      rows_by_page,
+                                      selected_rows_by_page,
                                       chunks_by_page);
 
       for (auto page_idx : touched_page_indices) {
@@ -4181,7 +5023,7 @@ lance_bulk_read_result read_lance_bulk(std::vector<std::unique_ptr<datasource>> 
                      "Lance page encoding does not match schema type width");
         auto const& chunks = chunks_by_page[page_idx];
         std::vector<std::vector<std::pair<size_type, size_type>>> rows_by_chunk(chunks.size());
-        for (auto const& [output_row, row_in_page] : rows_by_page[page_idx]) {
+        for (auto const& [output_row, row_in_page] : selected_rows_by_page[page_idx]) {
           auto const chunk_idx = find_miniblock_chunk_for_row(chunks, row_in_page);
           auto const& chunk    = chunks[chunk_idx];
           auto const row_in_chunk =

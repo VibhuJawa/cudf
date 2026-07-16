@@ -5,6 +5,7 @@ cimport pylibcudf.libcudf.io.types as cudf_io_types
 cimport pylibcudf.libcudf.table.table_view as cudf_table_view
 
 from cuda.bindings.cyruntime cimport cudaStream_t
+from libc.stdint cimport uint64_t
 from libcpp.optional cimport optional
 from libcpp.string cimport string
 from libcpp.vector cimport vector
@@ -42,6 +43,17 @@ cdef extern from "cudf/io/experimental/lance.hpp" \
             cudf_io_types.source_info source
         ) except +libcudf_exception_handler
 
+    cdef cppclass lance_bulk_reader_options:
+        lance_bulk_reader_options() except +libcudf_exception_handler
+
+        @staticmethod
+        lance_bulk_reader_options_builder builder(
+            cudf_io_types.source_info source
+        ) except +libcudf_exception_handler
+
+    cdef cppclass lance_bulk_read_result:
+        cudf_io_types.table_with_metadata data
+
     cdef cppclass lance_writer_options_builder:
         lance_writer_options_builder() except +libcudf_exception_handler
 
@@ -72,6 +84,21 @@ cdef extern from "cudf/io/experimental/lance.hpp" \
 
         lance_reader_options build() except +libcudf_exception_handler
 
+    cdef cppclass lance_bulk_reader_options_builder:
+        lance_bulk_reader_options_builder() except +libcudf_exception_handler
+
+        lance_bulk_reader_options_builder& columns(
+            vector[string] columns
+        ) except +libcudf_exception_handler
+        lance_bulk_reader_options_builder& rows(
+            vector[vector[size_type]] rows_per_source
+        ) except +libcudf_exception_handler
+        lance_bulk_reader_options_builder& read_coalesce_gap_bytes(
+            uint64_t bytes
+        ) except +libcudf_exception_handler
+
+        lance_bulk_reader_options build() except +libcudf_exception_handler
+
     cdef void write_lance(
         const lance_writer_options& options,
         cudaStream_t stream,
@@ -79,6 +106,12 @@ cdef extern from "cudf/io/experimental/lance.hpp" \
 
     cdef cudf_io_types.table_with_metadata read_lance(
         const lance_reader_options& options,
+        cudaStream_t stream,
+        device_async_resource_ref mr,
+    ) except +libcudf_exception_handler
+
+    cdef lance_bulk_read_result read_lance_bulk(
+        const lance_bulk_reader_options& options,
         cudaStream_t stream,
         device_async_resource_ref mr,
     ) except +libcudf_exception_handler

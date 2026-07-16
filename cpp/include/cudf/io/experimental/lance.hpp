@@ -39,10 +39,11 @@ class lance_writer_options_builder;
 /**
  * @brief Settings for `write_lance()`.
  *
- * The initial experimental writer emits a self-described Lance v2.2 data file for non-null,
- * top-level fixed-width columns.  Page payloads use Lance v2.2 MiniBlock chunks so ZSTD
- * compression can be applied by cuDF's device compression path and decoded by Lance's existing
- * block-compression reader.
+ * The initial experimental writer emits a self-described Lance v2.2 data file for either non-null
+ * top-level fixed-width columns or non-null `LIST<UINT8>` image columns. Fixed-width page payloads
+ * use Lance v2.2 MiniBlock chunks with optional ZSTD compression. `LIST<UINT8>` image columns are
+ * written as Lance FullZip `large_binary` pages and currently require `compression_type::NONE`, a
+ * lookup-oriented profile for already-compressed image bytes.
  */
 class lance_writer_options {
   sink_info _sink;
@@ -381,19 +382,19 @@ class lance_bulk_reader_options_builder;
 struct lance_read_metrics {
   /// Bytes requested in the final output
   std::uint64_t requested_output_bytes{};
-  /// Encoded MiniBlock bytes read
+  /// Encoded MiniBlock or FullZip value bytes selected by the request
   std::uint64_t compressed_miniblock_bytes_touched{};
-  /// Decoded MiniBlock value bytes
+  /// Decoded MiniBlock or FullZip value bytes produced by decompression
   std::uint64_t uncompressed_miniblock_bytes_decompressed{};
   /// Physical bytes read after coalescing
   std::uint64_t coalesced_file_bytes_read{};
-  /// MiniBlock ranges before scheduling
+  /// Physical value ranges before scheduling
   std::uint64_t file_ranges_before_coalescing{};
   /// Physical file ranges issued
   std::uint64_t file_ranges_after_coalescing{};
   /// Output rows requested
   std::uint64_t rows_requested{};
-  /// MiniBlocks selected by the request
+  /// MiniBlocks or FullZip pages selected by the request
   std::uint64_t touched_miniblocks{};
   /// Columns read across all sources
   std::uint64_t columns_touched{};
@@ -414,7 +415,9 @@ struct lance_bulk_read_result {
  *
  * This API reads sparse row selections from many Lance sources in one scheduling scope. Rows are
  * emitted in input-source order, and within each source they preserve the order supplied in that
- * source's row-selection vector.
+ * source's row-selection vector. It supports the fixed-width MiniBlock columns handled by
+ * `read_lance()` and the canonical non-null FullZip `large_binary` image column as a
+ * `LIST<UINT8>` output column.
  */
 class lance_bulk_reader_options {
   source_info _source;
@@ -473,7 +476,7 @@ class lance_bulk_reader_options {
   }
 
   /**
-   * @brief Returns maximum byte gap to coalesce between selected MiniBlock file ranges.
+   * @brief Returns maximum byte gap to coalesce between selected sparse value file ranges.
    *
    * @return Maximum coalescing gap in bytes
    */
@@ -533,7 +536,7 @@ class lance_bulk_reader_options_builder {
   }
 
   /**
-   * @brief Set maximum byte gap to coalesce between selected MiniBlock file ranges.
+   * @brief Set maximum byte gap to coalesce between selected sparse value file ranges.
    *
    * @param bytes Maximum gap in bytes
    * @return this for chaining

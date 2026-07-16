@@ -3,8 +3,11 @@
 
 from rmm.pylibrmm.memory_resource cimport DeviceMemoryResource
 
+from libc.stdint cimport uint64_t
 from pylibcudf.io.types cimport SinkInfo, SourceInfo, TableWithMetadata
 from pylibcudf.libcudf.io.lance cimport (
+    lance_bulk_reader_options,
+    lance_bulk_reader_options_builder,
     lance_reader_options,
     lance_reader_options_builder,
     lance_writer_options,
@@ -45,4 +48,20 @@ cdef class LanceReaderOptionsBuilder:
 
 cpdef TableWithMetadata read_lance(
     LanceReaderOptions options, object stream = *, DeviceMemoryResource mr=*
+)
+
+cdef class LanceBulkReaderOptions:
+    cdef lance_bulk_reader_options c_obj
+    cdef SourceInfo source
+
+cdef class LanceBulkReaderOptionsBuilder:
+    cdef lance_bulk_reader_options_builder c_obj
+    cdef SourceInfo source
+    cpdef LanceBulkReaderOptionsBuilder columns(self, list col_names)
+    cpdef LanceBulkReaderOptionsBuilder rows(self, list rows_per_source)
+    cpdef LanceBulkReaderOptionsBuilder read_coalesce_gap_bytes(self, uint64_t bytes)
+    cpdef LanceBulkReaderOptions build(self)
+
+cpdef TableWithMetadata read_lance_bulk(
+    LanceBulkReaderOptions options, object stream = *, DeviceMemoryResource mr=*
 )

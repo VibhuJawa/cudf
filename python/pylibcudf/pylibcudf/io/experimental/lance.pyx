@@ -3,6 +3,7 @@
 
 from cuda.bindings.cyruntime cimport cudaStream_t
 
+from libc.stdint cimport uint64_t
 from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
@@ -12,8 +13,11 @@ from rmm.pylibrmm.stream cimport Stream
 
 from pylibcudf.io.types cimport SinkInfo, SourceInfo, TableWithMetadata
 from pylibcudf.libcudf.io.lance cimport (
+    lance_bulk_read_result,
+    lance_bulk_reader_options,
     lance_reader_options,
     lance_writer_options,
+    read_lance_bulk as cpp_read_lance_bulk,
     read_lance as cpp_read_lance,
     write_lance as cpp_write_lance,
 )
@@ -24,11 +28,14 @@ from pylibcudf.utils cimport _get_memory_resource, _get_stream
 
 
 __all__ = [
+    "LanceBulkReaderOptions",
+    "LanceBulkReaderOptionsBuilder",
     "LanceReaderOptions",
     "LanceReaderOptionsBuilder",
     "LanceWriterOptions",
     "LanceWriterOptionsBuilder",
     "read_lance",
+    "read_lance_bulk",
     "write_lance",
 ]
 
@@ -243,6 +250,105 @@ cdef class LanceReaderOptionsBuilder:
         return lance_options
 
 
+cdef class LanceBulkReaderOptions:
+    """Settings for reading sparse rows from multiple Lance data files."""
+
+    @staticmethod
+    def builder(SourceInfo source):
+        """
+        Create a builder for Lance bulk reader options.
+
+        Parameters
+        ----------
+        source : SourceInfo
+            Sources to read.
+
+        Returns
+        -------
+        LanceBulkReaderOptionsBuilder
+        """
+        cdef LanceBulkReaderOptionsBuilder lance_builder = (
+            LanceBulkReaderOptionsBuilder.__new__(LanceBulkReaderOptionsBuilder)
+        )
+        lance_builder.c_obj = lance_bulk_reader_options.builder(source.c_obj)
+        lance_builder.source = source
+        return lance_builder
+
+
+cdef class LanceBulkReaderOptionsBuilder:
+    cpdef LanceBulkReaderOptionsBuilder columns(self, list col_names):
+        """
+        Sets names of the columns to read.
+
+        Parameters
+        ----------
+        col_names : list[str]
+            List of column names.
+
+        Returns
+        -------
+        LanceBulkReaderOptionsBuilder
+        """
+        cdef vector[string] c_column_names
+        c_column_names.reserve(len(col_names))
+        for col in col_names:
+            if not isinstance(col, str):
+                raise TypeError("Column names must be strings!")
+            c_column_names.push_back(col.encode())
+        self.c_obj.columns(c_column_names)
+        return self
+
+    cpdef LanceBulkReaderOptionsBuilder rows(self, list rows_per_source):
+        """
+        Sets zero-based row indices to read from each source.
+
+        Parameters
+        ----------
+        rows_per_source : list[list[int]]
+            Row ids to read, one row-id list per source.
+
+        Returns
+        -------
+        LanceBulkReaderOptionsBuilder
+        """
+        cdef vector[vector[size_type]] c_rows_per_source
+        cdef vector[size_type] c_rows
+        c_rows_per_source.reserve(len(rows_per_source))
+        for row_indices in rows_per_source:
+            c_rows.clear()
+            c_rows.reserve(len(row_indices))
+            for row in row_indices:
+                c_rows.push_back(row)
+            c_rows_per_source.push_back(c_rows)
+        self.c_obj.rows(c_rows_per_source)
+        return self
+
+    cpdef LanceBulkReaderOptionsBuilder read_coalesce_gap_bytes(self, uint64_t bytes):
+        """
+        Sets maximum byte gap to coalesce between selected file ranges.
+
+        Parameters
+        ----------
+        bytes : int
+            Maximum gap in bytes.
+
+        Returns
+        -------
+        LanceBulkReaderOptionsBuilder
+        """
+        self.c_obj.read_coalesce_gap_bytes(bytes)
+        return self
+
+    cpdef LanceBulkReaderOptions build(self):
+        """Build Lance bulk reader options."""
+        cdef LanceBulkReaderOptions lance_options = LanceBulkReaderOptions.__new__(
+            LanceBulkReaderOptions
+        )
+        lance_options.c_obj = move(self.c_obj.build())
+        lance_options.source = self.source
+        return lance_options
+
+
 cpdef TableWithMetadata read_lance(
     LanceReaderOptions options, object stream = None, DeviceMemoryResource mr=None
 ):
@@ -266,3 +372,28 @@ cpdef TableWithMetadata read_lance(
         c_result = move(cpp_read_lance(options.c_obj, _cs, mr.get_mr()))
 
     return TableWithMetadata.from_libcudf(c_result, s, mr)
+
+
+cpdef TableWithMetadata read_lance_bulk(
+    LanceBulkReaderOptions options, object stream = None, DeviceMemoryResource mr=None
+):
+    """
+    Read sparse rows from multiple Lance data files.
+
+    Parameters
+    ----------
+    options : LanceBulkReaderOptions
+        Settings for controlling bulk reading behavior.
+    stream : Stream | None
+        CUDA stream used for device memory operations and kernel launches.
+    mr : DeviceMemoryResource, optional
+        Device memory resource used to allocate the returned table's memory.
+    """
+    cdef lance_bulk_read_result c_result
+    cdef Stream s = _get_stream(stream)
+    cdef cudaStream_t _cs = s.view().value()
+    mr = _get_memory_resource(mr)
+    with nogil:
+        c_result = move(cpp_read_lance_bulk(options.c_obj, _cs, mr.get_mr()))
+
+    return TableWithMetadata.from_libcudf(c_result.data, s, mr)

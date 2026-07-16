@@ -44,6 +44,23 @@ struct lance_sparse_copy_row {
   std::size_t type_width{};
 };
 
+struct lance_fullzip_binary_prefix {
+  std::uint8_t const* input{};
+  std::size_t prefix_size{};
+};
+
+struct lance_fullzip_binary_pack {
+  std::uint8_t const* input{};
+  std::size_t input_size{};
+  std::size_t output_offset{};
+};
+
+struct lance_binary_copy_span {
+  std::uint8_t const* input{};
+  std::uint8_t* output{};
+  std::size_t size{};
+};
+
 namespace {
 
 __global__ void pack_lance_miniblocks_kernel(lance_pack_chunk const* chunks,
@@ -85,6 +102,70 @@ __global__ void decode_lance_miniblock_headers_kernel(std::uint8_t const* const*
                               (static_cast<std::uint32_t>(header[3]) << 8) |
                               (static_cast<std::uint32_t>(header[4]) << 16) |
                               (static_cast<std::uint32_t>(header[5]) << 24);
+}
+
+__device__ std::uint64_t read_little_endian_prefix(std::uint8_t const* data,
+                                                   std::size_t prefix_size)
+{
+  std::uint64_t value = 0;
+  for (std::size_t byte_idx = 0; byte_idx < prefix_size; ++byte_idx) {
+    value |= static_cast<std::uint64_t>(data[byte_idx]) << (byte_idx * 8);
+  }
+  return value;
+}
+
+__global__ void decode_lance_fullzip_binary_prefixes_kernel(
+  lance_fullzip_binary_prefix const* prefixes,
+  std::uint64_t* decoded,
+  std::size_t num_prefixes)
+{
+  auto const idx = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx >= num_prefixes) { return; }
+
+  auto const prefix = prefixes[idx];
+  decoded[idx * 2] = read_little_endian_prefix(prefix.input, prefix.prefix_size);
+  decoded[idx * 2 + 1] =
+    read_little_endian_prefix(prefix.input + prefix.prefix_size, prefix.prefix_size);
+}
+
+__device__ void write_u64_le(std::uint8_t* output, std::uint64_t value)
+{
+  for (int byte_idx = 0; byte_idx < 8; ++byte_idx) {
+    output[byte_idx] = static_cast<std::uint8_t>((value >> (byte_idx * 8)) & 0xff);
+  }
+}
+
+__global__ void pack_lance_fullzip_binary_kernel(lance_fullzip_binary_pack const* spans,
+                                                 std::size_t num_spans,
+                                                 std::uint8_t* output)
+{
+  auto const span_idx = static_cast<std::size_t>(blockIdx.x);
+  if (span_idx >= num_spans) { return; }
+
+  auto const span = spans[span_idx];
+  auto* span_output = output + span.output_offset;
+  if (threadIdx.x == 0) {
+    write_u64_le(span_output, static_cast<std::uint64_t>(span.input_size));
+  }
+
+  auto* payload_output = span_output + sizeof(std::uint64_t);
+  for (auto idx = static_cast<std::size_t>(threadIdx.x); idx < span.input_size;
+       idx += static_cast<std::size_t>(blockDim.x)) {
+    payload_output[idx] = span.input[idx];
+  }
+}
+
+__global__ void copy_lance_binary_spans_kernel(lance_binary_copy_span const* spans,
+                                               std::size_t num_spans)
+{
+  auto const span_idx = static_cast<std::size_t>(blockIdx.x);
+  if (span_idx >= num_spans) { return; }
+
+  auto const span = spans[span_idx];
+  for (auto idx = static_cast<std::size_t>(threadIdx.x); idx < span.size;
+       idx += static_cast<std::size_t>(blockDim.x)) {
+    span.output[idx] = span.input[idx];
+  }
 }
 
 template <typename T>
@@ -206,6 +287,59 @@ void decode_lance_miniblock_headers(std::uint8_t const* const* headers,
                                           block_size,
                                           0,
                                           stream.value()>>>(headers, decoded, num_headers);
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
+void decode_lance_fullzip_binary_prefixes(lance_fullzip_binary_prefix const* prefixes,
+                                          std::uint64_t* decoded,
+                                          std::size_t num_prefixes,
+                                          rmm::cuda_stream_view stream)
+{
+  if (num_prefixes == 0) { return; }
+
+  constexpr int block_size = 256;
+  auto const grid_size     = (num_prefixes + block_size - 1) / block_size;
+  CUDF_EXPECTS(grid_size <= static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+               "Too many Lance FullZip binary prefixes to decode");
+  decode_lance_fullzip_binary_prefixes_kernel<<<static_cast<unsigned int>(grid_size),
+                                                block_size,
+                                                0,
+                                                stream.value()>>>(prefixes,
+                                                                  decoded,
+                                                                  num_prefixes);
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
+void pack_lance_fullzip_binary(lance_fullzip_binary_pack const* spans,
+                               std::size_t num_spans,
+                               std::uint8_t* output,
+                               rmm::cuda_stream_view stream)
+{
+  if (num_spans == 0) { return; }
+
+  constexpr int block_size = 256;
+  CUDF_EXPECTS(num_spans <= static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+               "Too many Lance FullZip binary values to pack");
+  pack_lance_fullzip_binary_kernel<<<static_cast<unsigned int>(num_spans),
+                                     block_size,
+                                     0,
+                                     stream.value()>>>(spans, num_spans, output);
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
+void copy_lance_binary_spans(lance_binary_copy_span const* spans,
+                             std::size_t num_spans,
+                             rmm::cuda_stream_view stream)
+{
+  if (num_spans == 0) { return; }
+
+  constexpr int block_size = 256;
+  CUDF_EXPECTS(num_spans <= static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+               "Too many Lance binary spans to copy");
+  copy_lance_binary_spans_kernel<<<static_cast<unsigned int>(num_spans),
+                                   block_size,
+                                   0,
+                                   stream.value()>>>(spans, num_spans);
   CUDF_CUDA_TRY(cudaPeekAtLastError());
 }
 

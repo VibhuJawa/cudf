@@ -6,6 +6,8 @@ from pylibcudf.io.experimental.hybrid_scan cimport (
     HybridScanReader,
 )
 from pylibcudf.io.experimental.lance cimport (
+    LanceBulkReaderOptions,
+    LanceBulkReaderOptionsBuilder,
     LanceReaderOptions,
     LanceReaderOptionsBuilder,
     LanceWriterOptions,
