@@ -8,6 +8,7 @@ from pylibcudf.io.types cimport SinkInfo, SourceInfo, TableWithMetadata
 from pylibcudf.libcudf.io.lance cimport (
     lance_bulk_reader_options,
     lance_bulk_reader_options_builder,
+    lance_row_location,
     lance_reader_options,
     lance_reader_options_builder,
     lance_writer_options,
@@ -59,6 +60,7 @@ cdef class LanceBulkReaderOptionsBuilder:
     cdef SourceInfo source
     cpdef LanceBulkReaderOptionsBuilder columns(self, list col_names)
     cpdef LanceBulkReaderOptionsBuilder rows(self, list rows_per_source)
+    cpdef LanceBulkReaderOptionsBuilder row_locations(self, list locations)
     cpdef LanceBulkReaderOptionsBuilder read_coalesce_gap_bytes(self, uint64_t bytes)
     cpdef LanceBulkReaderOptions build(self)
 

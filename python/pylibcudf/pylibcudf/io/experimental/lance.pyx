@@ -15,6 +15,7 @@ from pylibcudf.io.types cimport SinkInfo, SourceInfo, TableWithMetadata
 from pylibcudf.libcudf.io.lance cimport (
     lance_bulk_read_result,
     lance_bulk_reader_options,
+    lance_row_location,
     lance_reader_options,
     lance_writer_options,
     read_lance_bulk as cpp_read_lance_bulk,
@@ -321,6 +322,29 @@ cdef class LanceBulkReaderOptionsBuilder:
                 c_rows.push_back(row)
             c_rows_per_source.push_back(c_rows)
         self.c_obj.rows(c_rows_per_source)
+        return self
+
+    cpdef LanceBulkReaderOptionsBuilder row_locations(self, list locations):
+        """
+        Sets sparse source-row locations in global output order.
+
+        Parameters
+        ----------
+        locations : list[tuple[int, int]]
+            ``(source_index, row_index)`` pairs, one pair per output row.
+
+        Returns
+        -------
+        LanceBulkReaderOptionsBuilder
+        """
+        cdef vector[lance_row_location] c_locations
+        cdef lance_row_location location
+        c_locations.reserve(len(locations))
+        for source_index, row_index in locations:
+            location.source_index = source_index
+            location.row_index = row_index
+            c_locations.push_back(location)
+        self.c_obj.row_locations(c_locations)
         return self
 
     cpdef LanceBulkReaderOptionsBuilder read_coalesce_gap_bytes(self, uint64_t bytes):

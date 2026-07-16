@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 
+from cuda.bindings import runtime
 import pytest
 import pyarrow as pa
 
@@ -124,6 +125,34 @@ def test_read_lance_bulk_sparse_rows(tmp_path):
         {
             "value": [0, 6, 14, 1004, 1002],
             "key": [0, 3, 7, 102, 101],
+        }
+    )
+    assert_eq(expect, got)
+
+
+def test_read_lance_bulk_global_row_locations(tmp_path):
+    paths = []
+    for source_idx in range(2):
+        df = cudf.DataFrame(
+            {
+                "key": [source_idx * 100 + row for row in range(8)],
+                "value": [source_idx * 1000 + row * 2 for row in range(8)],
+            }
+        )
+        path = tmp_path / f"bulk_locations_{source_idx}.lance"
+        df.to_lance(path, compression="NONE", max_rows_per_page=8)
+        paths.append(path)
+
+    runtime.cudaDeviceSynchronize()
+    got = cudf.read_lance_bulk(
+        paths,
+        row_locations=[(1, 2), (0, 0), (1, 1), (0, 3), (0, 7)],
+        columns=["value", "key"],
+    )
+    expect = cudf.DataFrame(
+        {
+            "value": [1004, 0, 1002, 6, 14],
+            "key": [102, 0, 101, 3, 7],
         }
     )
     assert_eq(expect, got)

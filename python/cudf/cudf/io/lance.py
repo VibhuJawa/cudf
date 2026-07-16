@@ -11,6 +11,7 @@ import pylibcudf as plc
 
 from cudf.core.column import access_columns
 from cudf.core.dataframe import DataFrame
+from cudf.core.dtypes import ListDtype
 from cudf.core.index import RangeIndex
 from cudf.utils import ioutils
 
@@ -58,18 +59,30 @@ def _validate_lance_columns(columns, names):
     if not columns:
         raise ValueError("Lance writer requires at least one column")
 
+    image_columns = []
     for name, col in zip(names, columns, strict=True):
-        if col.dtype.kind not in "iuf":
+        is_image_column = (
+            isinstance(col.dtype, ListDtype)
+            and col.dtype.element_type.kind == "u"
+            and col.dtype.element_type.itemsize == 1
+        )
+        if col.dtype.kind not in "iuf" and not is_image_column:
             raise NotImplementedError(
-                "Lance writer currently supports only non-null fixed-width "
-                f"integer and floating-point columns; column {name!r} has "
-                f"dtype {col.dtype}"
+                "Lance writer currently supports non-null fixed-width integer "
+                "and floating-point columns or list<uint8> image columns; "
+                f"column {name!r} has dtype {col.dtype}"
             )
         if col.has_nulls():
             raise NotImplementedError(
                 "Lance writer currently supports only non-null columns; "
                 f"column {name!r} contains null values"
             )
+        image_columns.append(is_image_column)
+
+    if any(image_columns) and not all(image_columns):
+        raise NotImplementedError(
+            "Lance writer cannot mix fixed-width columns and list<uint8> image columns"
+        )
 
 
 def _normalize_lance_read_columns(columns):
@@ -121,6 +134,44 @@ def _normalize_lance_rows_per_source(rows_per_source):
     return [_normalize_lance_rows(rows) for rows in iterator]
 
 
+def _normalize_lance_row_locations(row_locations):
+    if row_locations is None:
+        raise TypeError("row_locations is required")
+    if isinstance(row_locations, (str, bytes)):
+        raise TypeError("row_locations must be a sequence of (source, row) pairs")
+
+    try:
+        iterator = iter(row_locations)
+    except TypeError as exc:
+        raise TypeError(
+            "row_locations must be a sequence of (source, row) pairs"
+        ) from exc
+
+    locations = []
+    for location in iterator:
+        if isinstance(location, (str, bytes)):
+            raise TypeError("row_locations must contain (source, row) pairs")
+        try:
+            source_index, row_index = location
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "row_locations must contain (source, row) pairs"
+            ) from exc
+        if isinstance(source_index, bool) or isinstance(row_index, bool):
+            raise TypeError("row_locations must contain integer source and row ids")
+        try:
+            source_index = operator.index(source_index)
+            row_index = operator.index(row_index)
+        except TypeError as exc:
+            raise TypeError(
+                "row_locations must contain integer source and row ids"
+            ) from exc
+        if source_index < 0 or row_index < 0:
+            raise ValueError("row_locations must contain non-negative source and row ids")
+        locations.append((source_index, row_index))
+    return locations
+
+
 def read_lance(
     filepath_or_buffer,
     columns=None,
@@ -162,19 +213,21 @@ def read_lance(
 
 def read_lance_bulk(
     filepath_or_buffer,
-    rows_per_source,
+    rows_per_source=None,
     columns=None,
     storage_options=None,
     bytes_per_thread=None,
     read_coalesce_gap_bytes: int | None = None,
+    row_locations=None,
 ) -> DataFrame:
     """Read sparse rows from multiple Lance data files using libcudf.
 
     This experimental reader batches a sparse lookup across many Lance files.
-    Rows are emitted in source order, and within each source they preserve the
-    order supplied in ``rows_per_source``. It supports the fixed-width columns
-    handled by :func:`read_lance` and the canonical non-null ``large_binary``
-    ``image`` column as a ``list<uint8>`` cuDF column.
+    Supply ``rows_per_source`` to emit rows in source order, or supply
+    ``row_locations`` as ``(source_index, row_index)`` pairs to preserve an
+    arbitrary global lookup order. It supports the fixed-width columns handled
+    by :func:`read_lance` and the canonical non-null ``large_binary`` ``image``
+    column as a ``list<uint8>`` cuDF column.
     """
     path_or_buf = ioutils.get_reader_filepath_or_buffer(
         path_or_data=filepath_or_buffer,
@@ -185,14 +238,25 @@ def read_lance_bulk(
     if isinstance(path_or_buf, (str, bytes, BytesIO)):
         raise TypeError("read_lance_bulk requires a sequence of sources")
     sources = list(path_or_buf)
-    rows = _normalize_lance_rows_per_source(rows_per_source)
-    if len(rows) != len(sources):
-        raise ValueError("rows_per_source must contain one row list per source")
+    if (rows_per_source is None) == (row_locations is None):
+        raise TypeError("supply exactly one of rows_per_source or row_locations")
+    if row_locations is None:
+        rows = _normalize_lance_rows_per_source(rows_per_source)
+        if len(rows) != len(sources):
+            raise ValueError("rows_per_source must contain one row list per source")
+    else:
+        locations = _normalize_lance_row_locations(row_locations)
+        if any(source_index >= len(sources) for source_index, _ in locations):
+            raise ValueError("row_locations contains a source index outside the sources")
 
     column_names = _normalize_lance_read_columns(columns)
     builder = plc.io.experimental.LanceBulkReaderOptions.builder(
         plc.io.SourceInfo(sources)
-    ).rows(rows)
+    )
+    if row_locations is None:
+        builder.rows(rows)
+    else:
+        builder.row_locations(locations)
     if column_names is not None:
         builder.columns(column_names)
     if read_coalesce_gap_bytes is not None:

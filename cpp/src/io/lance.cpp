@@ -4246,12 +4246,17 @@ std::vector<size_type> selected_rows(lance_file_info const& file_info,
 }
 
 table_metadata make_bulk_table_metadata(std::vector<std::string> const& column_names,
-                                        std::vector<std::size_t> num_rows_per_source)
+                                        std::vector<std::size_t> num_rows_per_source,
+                                        bool large_binary = false)
 {
   table_metadata metadata;
   metadata.schema_info.reserve(column_names.size());
   for (auto const& name : column_names) {
-    metadata.schema_info.push_back(column_name_info{name, {}});
+    auto& schema_info = metadata.schema_info.emplace_back(column_name_info{name, {}});
+    if (large_binary) {
+      schema_info.children.emplace_back("offsets");
+      schema_info.children.emplace_back("");
+    }
   }
   metadata.num_rows_per_source = std::move(num_rows_per_source);
   return metadata;
@@ -4565,7 +4570,8 @@ lance_bulk_read_result read_lance_bulk_uncompressed_binary(
 
   lance_bulk_read_result result;
   result.data.tbl      = std::make_unique<table>(std::move(output_columns));
-  result.data.metadata = make_bulk_table_metadata(column_names, std::move(num_rows_per_source));
+  result.data.metadata =
+    make_bulk_table_metadata(column_names, std::move(num_rows_per_source), true);
   result.metrics       = metrics;
   return result;
 }
@@ -4867,7 +4873,8 @@ lance_bulk_read_result read_lance_bulk_large_binary(
 
   lance_bulk_read_result result;
   result.data.tbl      = std::make_unique<table>(std::move(output_columns));
-  result.data.metadata = make_bulk_table_metadata(column_names, std::move(num_rows_per_source));
+  result.data.metadata =
+    make_bulk_table_metadata(column_names, std::move(num_rows_per_source), true);
   result.metrics       = metrics;
   return result;
 }

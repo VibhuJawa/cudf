@@ -54,6 +54,11 @@ cdef extern from "cudf/io/experimental/lance.hpp" \
     cdef cppclass lance_bulk_read_result:
         cudf_io_types.table_with_metadata data
 
+    cdef cppclass lance_row_location:
+        lance_row_location() except +libcudf_exception_handler
+        size_type source_index
+        size_type row_index
+
     cdef cppclass lance_writer_options_builder:
         lance_writer_options_builder() except +libcudf_exception_handler
 
@@ -92,6 +97,9 @@ cdef extern from "cudf/io/experimental/lance.hpp" \
         ) except +libcudf_exception_handler
         lance_bulk_reader_options_builder& rows(
             vector[vector[size_type]] rows_per_source
+        ) except +libcudf_exception_handler
+        lance_bulk_reader_options_builder& row_locations(
+            vector[lance_row_location] locations
         ) except +libcudf_exception_handler
         lance_bulk_reader_options_builder& read_coalesce_gap_bytes(
             uint64_t bytes
